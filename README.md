@@ -10,29 +10,42 @@ This project provides a translation pipeline that:
 3. Generates Triton Gluon kernel source code
 4. Verifies translation correctness
 
+## Features
+
+- **Decorator Support**: Use `@to_gluon` decorator to seamlessly replace `@T.prim_func`
+- **Automatic Translation**: Automatically translates TileLang to Gluon at runtime
+- **JIT Compilation**: Automatically compiles Gluon kernels (max 8 parallel jobs)
+- **Smart Caching**: Two-level caching (memory + disk) to avoid recompilation
+- **Accuracy Verification**: Optional numerical accuracy verification
+- **Full Test Coverage**: 30+ test cases covering translation, decorator, and integration tests
+
 ## Project Structure
 
 ```
 tilelang-to-gluon-translator/
 ├── src/
-│   ├── __init__.py
-│   ├── parser.py          # Parse TileLang AST
-│   ├── transformer.py     # Transform to Gluon IR
-│   ├── codegen.py         # Generate Gluon code
-│   ├── translator.py      # Main orchestration
-│   └── verifier.py        # Verification utilities
+│   ├── __init__.py          # Package entry, exports to_gluon decorator
+│   ├── decorator.py         # @to_gluon decorator implementation
+│   ├── parser.py            # Parse TileLang AST
+│   ├── transformer.py       # Transform to Gluon IR
+│   ├── codegen.py           # Generate Gluon code
+│   ├── translator.py        # Main orchestration
+│   └── verifier.py          # Verification utilities
 ├── tests/
+│   ├── test_decorator.py    # Decorator tests
 │   ├── test_parser.py
 │   ├── test_transformer.py
 │   ├── test_codegen.py
 │   └── test_integration.py
 ├── docs/
-│   ├── design.md          # Architecture design
-│   ├── mapping.md         # Primitive mapping table
-│   └── code-review.md     # Code review report
+│   ├── design.md            # Architecture design
+│   ├── mapping.md           # Primitive mapping table
+│   ├── decorator-design.md  # Decorator design doc
+│   └── code-review.md       # Code review report
 └── examples/
     ├── example_matmul.py
-    └── example_elementwise.py
+    ├── example_elementwise.py
+    └── verify_decorator.py  # Decorator verification script
 ```
 
 ## Installation
@@ -51,7 +64,56 @@ export PYTHONPATH="/mnt/d/yuliu/ws/triton/python:$PYTHONPATH"
 
 ## Usage
 
-### Command Line
+### Method 1: Using @to_gluon Decorator (Recommended)
+
+Simply replace `@T.prim_func` with `@to_gluon` and call directly:
+
+```python
+import tilelang.language as T
+from tilelang_to_gluon import to_gluon
+
+@to_gluon  # Replace @T.prim_func
+def matmul(
+    A: T.Tensor((M, K), T.float16),
+    B: T.Tensor((K, N), T.float16),
+    C: T.Tensor((M, N), T.float32),
+):
+    with T.Kernel(T.ceildiv(N, 128), T.ceildiv(M, 128), threads=128) as (bx, by):
+        A_shared = T.alloc_shared([128, 32], T.float16)
+        B_shared = T.alloc_shared([128, 32], T.float16)
+        C_local = T.alloc_fragment([128, 128], T.float32)
+        T.clear(C_local)
+        for k in T.Pipelined(T.ceildiv(K, 32), num_stages=2):
+            T.copy(A[by * 128, k * 32], A_shared)
+            T.copy(B[k * 32, bx * 128], B_shared)
+            T.gemm(A_shared, B_shared, C_local, False, True)
+        T.copy(C_local, C[by * 128, bx * 128])
+
+# Direct call - automatically translates, compiles, and runs
+import torch
+a = torch.randn(128, 64, device='cuda', dtype=torch.float16)
+b = torch.randn(64, 128, device='cuda', dtype=torch.float16)
+c = torch.empty(128, 128, device='cuda', dtype=torch.float32)
+
+matmul(a, b, c)  # First call: translate + compile + run
+matmul(a, b, c)  # Subsequent calls: use cache directly
+```
+
+#### Advanced Options
+
+```python
+@to_gluon(
+    max_jobs=8,        # Maximum parallel compilation jobs
+    verify=True,       # Enable numerical verification
+    atol=1e-2,         # Absolute tolerance
+    rtol=1e-2,         # Relative tolerance
+    cache_dir=None     # Custom cache directory
+)
+def my_kernel(...):
+    ...
+```
+
+#### Method 2: Using Translator API
 
 ```bash
 # Translate a single file
@@ -114,10 +176,14 @@ cd /mnt/d/yuliu/ws/tilelang-to-gluon-translator
 pytest tests/ -v
 
 # Run specific test file
+pytest tests/test_decorator.py -v
 pytest tests/test_parser.py -v
 
 # Run with coverage
 pytest tests/ --cov=src --cov-report=html
+
+# Verify decorator
+python examples/verify_decorator.py
 ```
 
 ## Verification

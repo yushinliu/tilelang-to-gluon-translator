@@ -56,6 +56,54 @@ TileLang Python AST -> TVM TIR AST -> TileLang IR
 
 ### Phase 2: Semantic Mapping
 
+## 3.5 @to_gluon Decorator Usage
+
+The `@to_gluon` decorator provides a seamless way to replace `@T.prim_func`:
+
+```python
+import tilelang.language as T
+from tilelang_to_gluon import to_gluon
+
+# Simply replace @T.prim_func with @to_gluon
+@to_gluon
+def matmul(
+    A: T.Tensor((M, K), T.float16),
+    B: T.Tensor((K, N), T.float16),
+    C: T.Tensor((M, N), T.float32),
+):
+    with T.Kernel(T.ceildiv(N, 128), T.ceildiv(M, 128), threads=128) as (bx, by):
+        # ... TileLang kernel body ...
+        pass
+
+# Call directly - translation and compilation happen automatically
+matmul(tensor_a, tensor_b, tensor_c)
+```
+
+### Decorator Options
+
+```python
+@to_gluon(
+    max_jobs=8,        # Maximum parallel compilation jobs (default: 8)
+    verify=True,       # Enable numerical verification (default: True)
+    atol=1e-2,         # Absolute tolerance for verification (default: 1e-2)
+    rtol=1e-2,         # Relative tolerance for verification (default: 1e-2)
+    cache_dir=None     # Custom cache directory (default: ~/.cache/tilelang-to-gluon)
+)
+def my_kernel(...):
+    ...
+```
+
+### How It Works
+
+1. **Decoration**: Wraps the TileLang kernel function with `TileLangGluonWrapper`
+2. **First Call**:
+   - Extract source code using `inspect.getsource()`
+   - Check cache for existing compiled kernel
+   - If cache miss: translate → compile → cache
+3. **Subsequent Calls**: Direct cache lookup and execution
+
+See `decorator-design.md` for detailed decorator architecture.
+
 See `mapping.md` for detailed primitive mapping.
 
 ### Phase 3: Layout Inference and Conversion
