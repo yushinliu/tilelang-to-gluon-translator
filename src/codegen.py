@@ -331,9 +331,9 @@ class GluonCodeGenerator:
         shared_layout_args = ", ".join([f"{a.name}_layout={a.layout}" for a in kernel.shared_allocs])
         # Also include register tensor layouts
         reg_layout_args = ", ".join([f"{r.name}_layout={r.layout}" for r in getattr(kernel, 'register_tensors', [])])
-        barrier_args = ", ".join([b.name for b in kernel.barriers])
-
-        all_args = ", ".join(filter(None, [desc_args, shared_layout_args, reg_layout_args, barrier_args]))
+        # Barrier constexpr params already have defaults in generated kernel
+        # signature; do not pass them positionally in launcher call.
+        all_args = ", ".join(filter(None, [desc_args, shared_layout_args, reg_layout_args]))
 
         self.lines.append(
             f"{self._indent()}{kernel.name}_kernel[grid]({all_args})"

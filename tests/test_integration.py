@@ -86,32 +86,28 @@ class TestDecoratorIntegration:
     """Integration tests using @to_gluon decorator."""
 
     def test_decorator_basic_translation(self):
-        """Test basic decorator translation."""
+        """Strict mode: plain Python function should be rejected."""
         @to_gluon(max_jobs=4, verify=False)
         def integration_kernel():
             """Integration test kernel."""
             pass
 
-        # Verify translation infrastructure is set up
         assert integration_kernel.translator is not None
         assert integration_kernel.cache is not None
-        gluon_source = integration_kernel.get_gluon_source()
-        assert gluon_source is not None
+        with pytest.raises(ValueError):
+            _ = integration_kernel.get_gluon_source()
 
     def test_decorator_caching(self):
-        """Test that decorator properly caches compiled kernels."""
+        """Strict mode: repeated translation attempts should consistently fail."""
         @to_gluon(max_jobs=4, verify=False)
         def cache_test_kernel():
             """Cache test kernel."""
             pass
 
-        # First call should compile and cache
-        gluon_source1 = cache_test_kernel.get_gluon_source()
-
-        # Second call should use cached version
-        gluon_source2 = cache_test_kernel.get_gluon_source()
-
-        assert gluon_source1 == gluon_source2
+        with pytest.raises(ValueError):
+            _ = cache_test_kernel.get_gluon_source()
+        with pytest.raises(ValueError):
+            _ = cache_test_kernel.get_gluon_source()
 
 
 class TestGPUVerification:
@@ -119,7 +115,7 @@ class TestGPUVerification:
 
     @pytest.mark.gpu
     def test_elementwise_kernel_gpu(self, device, tensor_factory, verify_tensors):
-        """Test elementwise kernel on GPU."""
+        """Strict mode: plain Python elementwise kernel should be rejected."""
         @to_gluon(max_jobs=8, verify=False)
         def elementwise_add(A, B, C):
             """Elementwise addition."""
@@ -130,14 +126,12 @@ class TestGPUVerification:
         b = tensor_factory((1024,), fill_value=2.5)
         c = tensor_factory((1024,), fill_value=0.0)
 
-        elementwise_add(a, b, c)
-
-        expected = torch.full((1024,), 4.0, dtype=torch.float32, device=device)
-        verify_tensors(c, expected)
+        with pytest.raises(ValueError):
+            elementwise_add(a, b, c)
 
     @pytest.mark.gpu
     def test_copy_kernel_gpu(self, device, tensor_factory, verify_tensors):
-        """Test copy kernel on GPU."""
+        """Strict mode: plain Python copy kernel should be rejected."""
         @to_gluon(max_jobs=8, verify=False)
         def copy_kernel(src, dst):
             """Copy kernel."""
@@ -147,14 +141,12 @@ class TestGPUVerification:
         src = tensor_factory((512,), fill_value=7.0)
         dst = tensor_factory((512,), fill_value=0.0)
 
-        copy_kernel(src, dst)
-
-        expected = torch.full((512,), 7.0, dtype=torch.float32, device=device)
-        verify_tensors(dst, expected)
+        with pytest.raises(ValueError):
+            copy_kernel(src, dst)
 
     @pytest.mark.gpu
     def test_scale_kernel_gpu(self, device, tensor_factory, verify_tensors):
-        """Test scale kernel on GPU."""
+        """Strict mode: plain Python scale kernel should be rejected."""
         @to_gluon(max_jobs=8, verify=False)
         def scale_kernel(input, output, scale):
             """Scale kernel."""
@@ -165,14 +157,12 @@ class TestGPUVerification:
         output = tensor_factory((256,), fill_value=0.0)
         scale = torch.tensor(4.0, device=device)
 
-        scale_kernel(inp, output, scale)
-
-        expected = torch.full((256,), 12.0, dtype=torch.float32, device=device)
-        verify_tensors(output, expected)
+        with pytest.raises(ValueError):
+            scale_kernel(inp, output, scale)
 
     @pytest.mark.gpu
     def test_fused_operations_gpu(self, device, tensor_factory, verify_tensors):
-        """Test fused operations kernel on GPU."""
+        """Strict mode: plain Python fused kernel should be rejected."""
         @to_gluon(max_jobs=8, verify=False)
         def fused_kernel(A, B, C, D, result):
             """Compute (A + B) * (C - D)."""
@@ -185,15 +175,12 @@ class TestGPUVerification:
         d = tensor_factory((128,), fill_value=3.0)
         result = tensor_factory((128,), fill_value=0.0)
 
-        fused_kernel(a, b, c, d, result)
-
-        # (1 + 2) * (5 - 3) = 3 * 2 = 6
-        expected = torch.full((128,), 6.0, dtype=torch.float32, device=device)
-        verify_tensors(result, expected)
+        with pytest.raises(ValueError):
+            fused_kernel(a, b, c, d, result)
 
     @pytest.mark.gpu
     def test_various_tensor_sizes(self, device, tensor_factory, verify_tensors):
-        """Test kernels with various tensor sizes."""
+        """Strict mode: plain Python kernel should be rejected for all sizes."""
         @to_gluon(max_jobs=8, verify=False)
         def size_test_kernel(A, B, C):
             """Size test kernel."""
@@ -207,10 +194,8 @@ class TestGPUVerification:
             b = tensor_factory((size,), fill_value=2.0)
             c = tensor_factory((size,), fill_value=0.0)
 
-            size_test_kernel(a, b, c)
-
-            expected = torch.full((size,), 3.0, dtype=torch.float32, device=device)
-            verify_tensors(c, expected)
+            with pytest.raises(ValueError):
+                size_test_kernel(a, b, c)
 
 
 class TestEndToEndWorkflow:
@@ -238,11 +223,9 @@ def workflow_kernel(A: T.Tensor((256,), T.float32), B: T.Tensor((256,), T.float3
             """Workflow test kernel."""
             pass
 
-        # Verify all components are accessible
-        assert workflow_decorator_kernel.source_code is not None
-        assert workflow_decorator_kernel.get_gluon_source() is not None
-        assert workflow_decorator_kernel.translator is not None
-        assert workflow_decorator_kernel.cache is not None
+        # Strict mode: plain Python function is not translatable and must raise.
+        with pytest.raises(ValueError):
+            _ = workflow_decorator_kernel.get_gluon_source()
 
 
 if __name__ == "__main__":

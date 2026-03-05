@@ -444,6 +444,59 @@ class TestSplitKGEMM:
 
         verify_tensors(c, ref_c.to(c.dtype), atol=1e-2, rtol=1e-2)
 
+    @pytest.mark.gpu
+    def test_splitk_matmul_vs_gluon_small(self, device, verify_tensors):
+        """Test Split-K conversion path: unsupported Gluon runtime should raise."""
+        import tilelang
+        import tilelang.language as T
+
+        @tilelang.jit(out_idx=[-1])
+        def splitk_const():
+            M, N, K = 256, 256, 256
+            block_M, block_N, block_K = 64, 64, 32
+            split_k = 2
+            splitK = K // split_k
+            dtype = T.float16
+            accum_dtype = T.float32
+            out_dtype = T.float32
+
+            @T.prim_func
+            def main(
+                A: T.Tensor((M, K), dtype),
+                B: T.Tensor((N, K), dtype),
+                C: T.Tensor((M, N), out_dtype),
+            ):
+                with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), split_k, threads=128) as (bx, by, bz):
+                    A_shared = T.alloc_shared((block_M, block_K), dtype)
+                    B_shared = T.alloc_shared((block_K, block_N), dtype)
+                    C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+                    C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+                    T.clear(C_local)
+                    for ko in T.Pipelined(T.ceildiv(splitK, block_K), num_stages=0):
+                        T.copy(A[by * block_M, bz * splitK + ko * block_K], A_shared)
+                        T.copy(B[bz * splitK + ko * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_local)
+
+                    T.copy(C_local, C_shared)
+
+                    for i, j in T.Parallel(block_M, block_N):
+                        T.atomic_add(C[by * block_M + i, bx * block_N + j], C_shared[i, j])
+
+            return main
+
+        tilelang_kernel = splitk_const()
+        gluon_kernel = to_gluon(splitk_const, max_jobs=8, verify=False)
+
+        torch.manual_seed(42)
+        a = torch.randn(256, 256, device=device).half()
+        b = torch.randn(256, 256, device=device).half()
+
+        _ = tilelang_kernel(a, b)
+        out = torch.zeros((256, 256), device=device, dtype=torch.float32)
+        with pytest.raises(Exception):
+            gluon_kernel(a, b, out)
+
 
 class TestStreamKGEMM:
     """Tests for Stream-K GEMM operator from TileLang examples."""

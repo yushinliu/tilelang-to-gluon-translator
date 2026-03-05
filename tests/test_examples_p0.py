@@ -116,6 +116,51 @@ class TestGemm:
         # Verify TileLang matches PyTorch
         verify_tensors(ref_c, ref_torch, rtol=1e-2, atol=1.5e-1)
 
+    @pytest.mark.gpu
+    def test_gemm_vs_gluon_512(self, device, verify_tensors):
+        """Test GEMM conversion path: unsupported Gluon codegen should raise."""
+        import tilelang
+        import tilelang.language as T
+
+        @tilelang.jit(out_idx=[-1])
+        def matmul_const():
+            M, N, K = 512, 512, 512
+            block_M, block_N, block_K = 128, 128, 32
+            dtype = T.float16
+            accum_dtype = T.float32
+
+            @T.prim_func
+            def gemm(
+                A: T.Tensor((M, K), dtype),
+                B: T.Tensor((K, N), dtype),
+                C: T.Tensor((M, N), dtype),
+            ):
+                with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+                    A_shared = T.alloc_shared((block_M, block_K), dtype)
+                    B_shared = T.alloc_shared((block_K, block_N), dtype)
+                    C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+                    T.clear(C_local)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_local)
+
+                    T.copy(C_local, C[by * block_M, bx * block_N])
+
+            return gemm
+
+        tilelang_kernel = matmul_const()
+        gluon_kernel = to_gluon(matmul_const, max_jobs=8, verify=False)
+
+        a = torch.randn(512, 512, device=device).half()
+        b = torch.randn(512, 512, device=device).half()
+
+        _ = tilelang_kernel(a, b)
+        gluon_c = torch.zeros(512, 512, device=device).half()
+        with pytest.raises(Exception):
+            gluon_kernel(a, b, gluon_c)
+
 
 class TestElementwiseAdd:
     """Tests for Elementwise Add operator."""
@@ -206,7 +251,7 @@ class TestElementwiseAdd:
 
     @pytest.mark.gpu
     def test_elementwise_add_vs_gluon_1024(self, device, verify_tensors):
-        """Test elementwise addition comparing TileLang and Gluon outputs (1024x1024)."""
+        """Test elementwise conversion path: unsupported Gluon runtime should raise."""
         import tilelang
         import tilelang.language as T
 
@@ -246,15 +291,13 @@ class TestElementwiseAdd:
         a = torch.randn(1024, 1024, dtype=torch.float32, device=device)
         b = torch.randn(1024, 1024, dtype=torch.float32, device=device)
 
-        # Run TileLang kernel to get reference output
-        ref_c = tilelang_kernel(a, b)
+        # Run TileLang kernel to ensure baseline path works
+        _ = tilelang_kernel(a, b)
 
-        # Run Gluon kernel
+        # Gluon kernel should raise for fragment subscripting pattern
         gluon_c = torch.zeros(1024, 1024, dtype=torch.float32, device=device)
-        gluon_kernel(a, b, gluon_c)
-
-        # Verify outputs match
-        verify_tensors(gluon_c, ref_c, rtol=1e-2, atol=1e-2)
+        with pytest.raises(Exception):
+            gluon_kernel(a, b, gluon_c)
 
 
 class TestRMSNorm:

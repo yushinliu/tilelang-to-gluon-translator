@@ -274,18 +274,7 @@ class TileLangGluonWrapper:
         try:
             gluon_code = self.translator.translate(self.source_code)
             self._gluon_source = gluon_code
-        except ValueError as e:
-            # Some tests intentionally decorate plain Python functions that are not
-            # TileLang kernels. In this case we keep decorator semantics and run the
-            # original function directly.
-            if "No kernel function found with @T.prim_func decorator" in str(e):
-                self._fallback_to_original = True
-                self._gluon_source = (
-                    "import torch\n"
-                    "# Fallback: non-TileLang function executed directly by @to_gluon\n"
-                )
-                self.cache.set(self.source_code, self.original_func)
-                return self.original_func
+        except ValueError:
             raise
 
         # Write generated code to a temporary file so Gluon can inspect it
@@ -353,26 +342,8 @@ class TileLangGluonWrapper:
             else:
                 torch_args.append(arg)
 
-        # Known incompatibility: fragment elementwise writes via subscripting are
-        # not reliably supported by current Gluon shared memory descriptor model.
-        # Use original TileLang execution path for correctness.
-        if self._has_fragment_subscript_elementwise:
-            return self._execute_original_fallback(torch_args, kwargs)
-
-        # Call the compiled Gluon kernel
-        try:
-            result = self._compiled_kernel(*torch_args, **kwargs)
-            if self._should_silent_fallback(torch_args, result):
-                return self._execute_original_fallback(torch_args, kwargs)
-            return result
-        except Exception as e:
-            # Known Gluon limitation: shared_memory_descriptor is not subscriptable
-            # for some fragment-style elementwise kernels. Fall back to the original
-            # TileLang kernel execution path for correctness.
-            msg = str(e)
-            if "shared_memory_descriptor" in msg and "not subscriptable" in msg:
-                return self._execute_original_fallback(torch_args, kwargs)
-            raise
+        # Strict behavior: if Gluon compilation/runtime fails, raise exception.
+        return self._compiled_kernel(*torch_args, **kwargs)
 
     def _execute_original_fallback(self, args, kwargs):
         """Execute original TileLang function as a compatibility fallback."""
@@ -407,17 +378,7 @@ class TileLangGluonWrapper:
     def get_gluon_source(self) -> Optional[str]:
         """Get the generated Gluon source code."""
         if self._gluon_source is None:
-            try:
-                self._gluon_source = self.translator.translate(self.source_code)
-            except ValueError as e:
-                if "No kernel function found with @T.prim_func decorator" in str(e):
-                    self._fallback_to_original = True
-                    self._gluon_source = (
-                        "import torch\n"
-                        "# Fallback: non-TileLang function executed directly by @to_gluon\n"
-                    )
-                else:
-                    raise
+            self._gluon_source = self.translator.translate(self.source_code)
         return self._gluon_source
 
 
