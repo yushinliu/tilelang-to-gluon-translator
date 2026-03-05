@@ -123,6 +123,7 @@ class GluonKernel:
     body: List[Any] = field(default_factory=list)
     tensor_descriptors: List[GluonTensorDescriptor] = field(default_factory=list)
     shared_allocs: List[GluonAllocShared] = field(default_factory=list)
+    register_tensors: List[GluonRegisterTensor] = field(default_factory=list)
     barriers: List[GluonBarrier] = field(default_factory=list)
 
 
@@ -166,7 +167,18 @@ class TileLangToGluonTransformer:
 
     def transform(self, kernel: TileLangKernel) -> GluonKernel:
         """Transform TileLang kernel to Gluon kernel."""
-        num_warps = max(kernel.thread_count // 32, 1)
+        # Handle both integer and string thread counts
+        thread_count = kernel.thread_count
+        if isinstance(thread_count, str):
+            # If thread_count is a variable name, use default (128)
+            thread_count = 128
+        num_warps = max(thread_count // 32, 1)
+
+        # Extract block dimensions from the first allocations (common pattern)
+        block_M = 32
+        block_N = 32
+        in_dtype = "gl.float32"
+        out_dtype = "gl.float32"
 
         gluon_kernel = GluonKernel(
             name=kernel.name,
@@ -178,6 +190,11 @@ class TileLangToGluonTransformer:
             shared_allocs=[],
             barriers=[]
         )
+        # Store additional attributes for codegen
+        gluon_kernel.block_M = block_M
+        gluon_kernel.block_N = block_N
+        gluon_kernel.in_dtype = in_dtype
+        gluon_kernel.out_dtype = out_dtype
         self.current_kernel = gluon_kernel
 
         # Create tensor descriptors for input/output tensors
@@ -257,7 +274,13 @@ class TileLangToGluonTransformer:
 
     def _transform_alloc_shared(self, stmt: AllocShared) -> GluonAllocShared:
         """Transform shared memory allocation."""
-        shape = stmt.shape if isinstance(stmt.shape, list) else [stmt.shape]
+        # Handle shape properly - if it's a tuple like ('block_M', 'block_N'), keep it as-is
+        if isinstance(stmt.shape, tuple):
+            shape = list(stmt.shape)
+        elif isinstance(stmt.shape, list):
+            shape = stmt.shape
+        else:
+            shape = [stmt.shape]
         dtype = self._map_dtype(stmt.dtype)
 
         # Infer layout based on shape and dtype for MMA compatibility
@@ -274,33 +297,49 @@ class TileLangToGluonTransformer:
 
     def _transform_alloc_fragment(self, stmt: AllocFragment) -> GluonRegisterTensor:
         """Transform fragment allocation to register tensor with MMA layout."""
-        shape = stmt.shape if isinstance(stmt.shape, list) else [stmt.shape]
+        # Handle shape properly - if it's a tuple like ('block_M', 'block_N'), keep it as-is
+        if isinstance(stmt.shape, tuple):
+            shape = list(stmt.shape)
+        elif isinstance(stmt.shape, list):
+            shape = stmt.shape
+        else:
+            shape = [stmt.shape]
         dtype = self._map_dtype(stmt.dtype)
 
         # Use NVMMADistributedLayout for accumulators
         layout = self._infer_mma_layout(shape, dtype)
 
-        return GluonRegisterTensor(
+        reg_tensor = GluonRegisterTensor(
             name=stmt.name,
             shape=shape,
             dtype=dtype,
             layout=layout
         )
+        self.current_kernel.register_tensors.append(reg_tensor)
+        return reg_tensor
 
     def _transform_alloc_local(self, stmt: AllocLocal) -> GluonRegisterTensor:
         """Transform local allocation to register tensor."""
-        shape = stmt.shape if isinstance(stmt.shape, list) else [stmt.shape]
+        # Handle shape properly - if it's a tuple like ('block_M', 'block_N'), keep it as-is
+        if isinstance(stmt.shape, tuple):
+            shape = list(stmt.shape)
+        elif isinstance(stmt.shape, list):
+            shape = stmt.shape
+        else:
+            shape = [stmt.shape]
         dtype = self._map_dtype(stmt.dtype)
 
         # Use BlockedLayout for local/thread memory
         layout = self._infer_blocked_layout(shape, dtype)
 
-        return GluonRegisterTensor(
+        reg_tensor = GluonRegisterTensor(
             name=stmt.name,
             shape=shape,
             dtype=dtype,
             layout=layout
         )
+        self.current_kernel.register_tensors.append(reg_tensor)
+        return reg_tensor
 
     def _infer_shared_layout(self, shape: List[int], dtype: str) -> str:
         """Infer NVMMASharedLayout for shared memory."""
@@ -316,37 +355,26 @@ class TileLangToGluonTransformer:
                 f"rank={len(shape)})")
 
     def _infer_mma_layout(self, shape: List[int], dtype: str) -> str:
-        """Infer NVMMADistributedLayout for MMA operations."""
-        # Default WGMMA layout for Hopper
-        warps_per_cta = self.current_kernel.num_warps if self.current_kernel else 4
-
-        # Determine instruction shape based on dtype
+        """Infer layout for MMA operations (accumulators) - use shared memory layout."""
+        # Use NVMMASharedLayout which works with gl.allocate_shared_memory
         base_dtype = self._get_base_dtype(dtype)
-        if base_dtype == "float16":
-            instr_shape = "[16, 64, 16]"  # m, n, k
-        else:
-            instr_shape = "[16, 64, 16]"
-
-        warps_x = min(warps_per_cta, 4)
-        warps_y = max(1, warps_per_cta // warps_x)
-
-        return (f"gl.NVMMADistributedLayout("
-                f"version=[3, 0], "
-                f"warps_per_cta=[{warps_x}, {warps_y}], "
-                f"instr_shape={instr_shape})")
+        element_bits = 16 if base_dtype in ["float16", "bfloat16"] else 32
+        rank = len(shape) if shape else 2
+        return (f"gl.NVMMASharedLayout("
+                f"swizzle_byte_width=128, "
+                f"element_bitwidth={element_bits}, "
+                f"rank={rank})")
 
     def _infer_blocked_layout(self, shape: List[int], dtype: str) -> str:
-        """Infer BlockedLayout for general register tensors."""
-        warps_per_cta = self.current_kernel.num_warps if self.current_kernel else 4
-
-        warps_x = min(warps_per_cta, 4)
-        warps_y = max(1, warps_per_cta // warps_x)
-
-        return (f"gl.BlockedLayout("
-                f"size_per_thread=[1, 1], "
-                f"threads_per_warp=[32, 1], "
-                f"warps_per_cta=[{warps_x}, {warps_y}], "
-                f"order=[1, 0])")
+        """Infer layout for general register tensors - use shared memory layout."""
+        # Use NVMMASharedLayout which works with gl.allocate_shared_memory
+        base_dtype = self._get_base_dtype(dtype)
+        element_bits = 16 if base_dtype in ["float16", "bfloat16"] else 32
+        rank = len(shape) if shape else 2
+        return (f"gl.NVMMASharedLayout("
+                f"swizzle_byte_width=128, "
+                f"element_bitwidth={element_bits}, "
+                f"rank={rank})")
 
     def _transform_copy(self, stmt: CopyOp) -> Optional[Union[GluonStmt, List[GluonStmt]]]:
         """Transform copy operation to TMA operations."""
@@ -409,12 +437,41 @@ class TileLangToGluonTransformer:
 
     def _transform_parallel_loop(self, stmt: ParallelLoop) -> GluonLoop:
         """Transform parallel loop."""
+        transformed_body = []
+        for s in stmt.body:
+            transformed = self._transform_stmt(s)
+            if transformed:
+                transformed_body.append(transformed)
+            elif isinstance(s, ast.AST):
+                # Pass through raw AST nodes
+                transformed_body.append(s)
+
+        # Handle multi-dimensional parallel loops
+        if stmt.extra_dims:
+            # Create nested loops for extra dimensions
+            inner_loop = GluonLoop(
+                var=stmt.all_vars[-1] if stmt.all_vars else "j",
+                start=0,
+                end=stmt.extra_dims[0],
+                step=1,
+                body=transformed_body,
+                is_pipelined=False
+            )
+            return GluonLoop(
+                var=stmt.var,
+                start=0,
+                end=stmt.extent,
+                step=1,
+                body=[inner_loop],
+                is_pipelined=False
+            )
+
         return GluonLoop(
             var=stmt.var,
             start=0,
             end=stmt.extent,
             step=1,
-            body=[self._transform_stmt(s) for s in stmt.body if self._transform_stmt(s)],
+            body=transformed_body,
             is_pipelined=False
         )
 

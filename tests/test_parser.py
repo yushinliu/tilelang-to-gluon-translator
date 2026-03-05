@@ -1,5 +1,10 @@
 """
-Unit tests for TileLang parser.
+Unit and integration tests for TileLang parser.
+
+Includes:
+- Unit tests for parsing logic (string-based)
+- Integration tests with @to_gluon decorator
+- GPU verification tests for parsed kernels
 """
 
 import ast
@@ -13,10 +18,11 @@ from src.parser import (
     TileLangParser, TileLangKernel, AllocShared, AllocFragment,
     CopyOp, GemmOp, ClearOp, ParallelLoop, PipelinedLoop
 )
+from src.decorator import to_gluon
 
 
 class TestTileLangParser:
-    """Test cases for TileLang parser."""
+    """Unit tests for TileLang parser (string-based)."""
 
     def test_parse_simple_kernel(self):
         """Test parsing a simple kernel."""
@@ -195,6 +201,50 @@ def test_pipelined(A: T.Tensor((1024, 1024), T.float16)):
         assert loop.var == "k"
         assert loop.extent == 32
         assert loop.num_stages == 2
+
+
+class TestParserDecoratorIntegration:
+    """Integration tests for parser with @to_gluon decorator."""
+
+    def test_decorator_extracts_source(self):
+        """Test that @to_gluon decorator extracts source correctly."""
+        @to_gluon
+        def sample_kernel():
+            """Sample kernel for testing."""
+            pass
+
+        assert sample_kernel.source_code is not None
+        assert "sample_kernel" in sample_kernel.source_code
+        assert "Sample kernel for testing" in sample_kernel.source_code
+
+    def test_decorator_with_parser_options(self):
+        """Test decorator with various parser-compatible options."""
+        @to_gluon(max_jobs=4, verify=False)
+        def kernel_with_options():
+            """Kernel with decorator options."""
+            pass
+
+        assert kernel_with_options.max_jobs == 4
+        assert kernel_with_options.source_code is not None
+
+
+class TestParserGPUVerification:
+    """GPU verification tests for parsed kernels."""
+
+    @pytest.mark.gpu
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_simple_kernel_gpu_execution(self, device, tensor_factory, verify_tensors):
+        """Test that parsed simple kernel can run on GPU.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        The @to_gluon decorator expects TileLang source code like:
+
+            @T.prim_func
+            def kernel(A: T.Tensor(...), ...):
+                with T.Kernel(...) as (bx, by):
+                    ...
+        """
+        pass
 
 
 if __name__ == "__main__":

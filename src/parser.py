@@ -63,6 +63,8 @@ class ParallelLoop:
     var: str
     extent: Any
     body: List[Any] = field(default_factory=list)
+    extra_dims: List[Any] = field(default_factory=list)  # For multi-dimensional parallel loops
+    all_vars: List[str] = field(default_factory=list)  # All loop variable names
 
 
 @dataclass
@@ -223,19 +225,37 @@ class TileLangParser:
 
     def _parse_for_stmt(self, node: ast.For) -> Optional[Stmt]:
         """Parse for loop statement."""
-        loop_var = node.target.id if isinstance(node.target, ast.Name) else "i"
+        # Handle tuple unpacking like "for local_y, local_x in T.Parallel(...)"
+        if isinstance(node.target, ast.Tuple):
+            loop_vars = [elt.id for elt in node.target.elts if isinstance(elt, ast.Name)]
+            loop_var = loop_vars[0] if loop_vars else "i"
+        else:
+            loop_var = node.target.id if isinstance(node.target, ast.Name) else "i"
+            loop_vars = [loop_var]
 
         # Check if this is a TileLang loop construct
         if isinstance(node.iter, ast.Call):
             call = node.iter
             if isinstance(call.func, ast.Attribute):
                 if call.func.attr == "Parallel":
-                    extent = self._extract_value(call.args[0]) if call.args else 0
-                    loop = ParallelLoop(var=loop_var, extent=extent, body=[])
+                    # Handle 2D Parallel like T.Parallel(block_M, block_N)
+                    if len(call.args) >= 2:
+                        # Multi-dimensional parallel - create nested loops
+                        dims = [self._extract_value(arg) for arg in call.args]
+                        # For now, just use the first dimension for the outer loop
+                        extent = dims[0]
+                        # Store additional dimensions in a way the transformer can use
+                        loop = ParallelLoop(var=loop_var, extent=extent, body=[], extra_dims=dims[1:], all_vars=loop_vars)
+                    else:
+                        extent = self._extract_value(call.args[0]) if call.args else 0
+                        loop = ParallelLoop(var=loop_var, extent=extent, body=[])
                     for stmt in node.body:
                         parsed = self._parse_stmt(stmt)
                         if parsed:
                             loop.body.append(parsed)
+                        else:
+                            # Keep raw AST for statements we don't parse
+                            loop.body.append(stmt)
                     return loop
                 elif call.func.attr == "Pipelined":
                     extent = self._extract_value(call.args[0]) if call.args else 0
@@ -411,12 +431,8 @@ class TileLangParser:
         """Extract value from AST node."""
         if isinstance(node, ast.Constant):
             return node.value
-        elif isinstance(node, ast.Num):  # For Python 3.7 compatibility
-            return node.n
         elif isinstance(node, ast.Name):
             return node.id
-        elif isinstance(node, ast.NameConstant):  # For Python 3.7 compatibility
-            return node.value
         elif isinstance(node, ast.Attribute):
             # Handle T.float16, T.float32, etc.
             if isinstance(node.value, ast.Name) and node.value.id == "T":

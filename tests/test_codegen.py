@@ -1,5 +1,10 @@
 """
-Unit tests for Gluon code generator.
+Unit and integration tests for Gluon code generator.
+
+Includes:
+- Unit tests for code generation (string-based)
+- Decorator-based code generation tests
+- GPU execution tests for generated code
 """
 
 import pytest
@@ -11,10 +16,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.parser import TileLangParser
 from src.transformer import TileLangToGluonTransformer
 from src.codegen import GluonCodeGenerator
+from src.decorator import to_gluon
 
 
 class TestGluonCodeGenerator:
-    """Test cases for Gluon code generator."""
+    """Unit tests for Gluon code generator (string-based)."""
 
     def test_generate_imports(self):
         """Test import generation."""
@@ -101,6 +107,48 @@ def test_launcher(A: T.Tensor((1024,), T.float32)):
         # Check launcher function
         assert "def test_launcher(" in code
         assert "TensorDescriptor" in code
+
+
+class TestCodegenDecoratorIntegration:
+    """Integration tests for code generator with @to_gluon decorator."""
+
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_decorator_generates_code(self):
+        """Test that decorator generates Gluon code.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
+
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_generated_code_has_required_imports(self):
+        """Test that generated code includes required imports.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
+
+
+class TestCodegenGPUExecution:
+    """GPU execution tests for generated code."""
+
+    @pytest.mark.gpu
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_generated_kernel_gpu_execution(self, device, tensor_factory, verify_tensors):
+        """Test that generated kernel can execute on GPU.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
+
+    @pytest.mark.gpu
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_generated_code_correctness(self, device, tensor_factory, verify_tensors):
+        """Test numerical correctness of generated code.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
 
 
 if __name__ == "__main__":

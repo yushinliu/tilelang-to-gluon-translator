@@ -1,5 +1,10 @@
 """
-Unit tests for TileLang to Gluon transformer.
+Unit and integration tests for TileLang to Gluon transformer.
+
+Includes:
+- Unit tests for IR transformation (string-based)
+- Decorator-based transformation tests
+- GPU execution tests for transformed kernels
 """
 
 import pytest
@@ -14,10 +19,11 @@ from src.transformer import (
     GluonKernel, GluonAllocShared, GluonRegisterTensor,
     GluonMma, GluonTmaLoad, GluonLoop
 )
+from src.decorator import to_gluon
 
 
 class TestTileLangToGluonTransformer:
-    """Test cases for TileLang to Gluon transformer."""
+    """Unit tests for TileLang to Gluon transformer (string-based)."""
 
     def test_transform_simple_kernel(self):
         """Test transforming a simple kernel."""
@@ -82,7 +88,7 @@ def test_alloc(A: T.Tensor((1024,), T.float32)):
         assert alloc is not None
         assert alloc.shape == [128, 128]
         assert alloc.dtype == "gl.float32"
-        assert "NVMMADistributedLayout" in alloc.layout
+        assert "NVMMASharedLayout" in alloc.layout
 
     def test_transform_gemm(self):
         """Test transforming GEMM operation."""
@@ -128,6 +134,51 @@ def test_grid(A: T.Tensor((1024, 1024), T.float32)):
 
         # Grid should be computed from block dimensions
         assert len(gluon_kernel.grid) == 2
+
+
+class TestTransformerDecoratorIntegration:
+    """Integration tests for transformer with @to_gluon decorator."""
+
+    def test_decorator_creates_transformer(self):
+        """Test that decorator creates transformer correctly."""
+        @to_gluon(max_jobs=4, verify=False)
+        def test_kernel():
+            """Test kernel."""
+            pass
+
+        # Verify the wrapper was created with transformer
+        assert test_kernel.translator is not None
+        assert test_kernel.translator.transformer is not None
+
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_decorator_source_to_gluon(self):
+        """Test that decorator can extract and transform source.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
+
+
+class TestTransformerGPUExecution:
+    """GPU execution tests for transformed kernels."""
+
+    @pytest.mark.gpu
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_transformed_kernel_gpu_execution(self, device, tensor_factory, verify_tensors):
+        """Test that transformed kernel can execute on GPU.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
+
+    @pytest.mark.gpu
+    @pytest.mark.skip(reason="Requires actual TileLang environment with T.prim_func syntax")
+    def test_transformer_preserves_semantics(self, device, tensor_factory, verify_tensors):
+        """Test that transformation preserves kernel semantics.
+
+        Note: This test requires actual TileLang kernel syntax, not regular Python.
+        """
+        pass
 
 
 if __name__ == "__main__":
