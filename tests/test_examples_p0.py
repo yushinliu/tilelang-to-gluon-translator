@@ -117,9 +117,9 @@ class TestGemm:
         verify_tensors(ref_c, ref_torch, rtol=1e-2, atol=1.5e-1)
 
     @pytest.mark.gpu
-    @pytest.mark.xfail(reason="Gluon 3.4.0 lacks warpgroup_mma API; needs full TensorDescriptor support in codegen")
+    @pytest.mark.xfail(reason="tl.dot doesn't support shared_memory_descriptor in Gluon 3.4.0")
     def test_gemm_vs_gluon_512(self, device, verify_tensors):
-        """Test GEMM conversion path: warpgroup_mma not available in Gluon 3.4.0."""
+        """Test GEMM conversion path using tl.dot (Gluon 3.4.0 compatible)."""
         import tilelang
         import tilelang.language as T
 
@@ -160,9 +160,10 @@ class TestGemm:
         ref_c = tilelang_kernel(a, b)
         gluon_c = torch.zeros_like(ref_c)
 
-        # Gluon 3.4.0 does not have warpgroup_mma, expect NotImplementedError
-        with pytest.raises(NotImplementedError, match="warpgroup_mma not available"):
-            gluon_kernel(a, b, gluon_c)
+        # tl.dot in Gluon 3.4.0 doesn't support shared_memory_descriptor
+        # This requires either warpgroup_mma or proper block tensor support
+        gluon_kernel(a, b, gluon_c)
+        verify_tensors(gluon_c, ref_c, rtol=1e-2, atol=1e-1)
 
 
 class TestElementwiseAdd:

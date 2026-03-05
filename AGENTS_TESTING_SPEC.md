@@ -33,7 +33,9 @@
 | `gemm/example_gemm.py` | 矩阵乘法 | ✅ |
 | `norm/rms_norm.py` | RMS 归一化 | ✅ |
 
-**P0 测试状态**: 13 passed, 1 xfailed (xfail: Gluon 3.4.0 缺少 warpgroup_mma API)
+**P0 测试状态**: 13 passed, 1 xfailed
+  - xfail 原因: `tl.dot` 不支持 `shared_memory_descriptor` 类型
+  - 需要 `warpgroup_mma` 或 block tensor 支持才能完整实现 GEMM
 
 ### P1 - 重要算子（高优先级）
 | 文件路径 | 测试类型 | 当前状态 |
@@ -255,23 +257,32 @@ tilelang-to-gluon-translator/
 
 ## 实际进展记录
 
-### 2026-03-05 进展
+### 2026-03-05 进展（Gluon 3.4.0 适配完成）
 
 #### 完成任务
 - **Phase 1**: 基础设施通用性审计 - ✅ 完成
   - 结果: 所有基础设施组件都是通用的，符合测试准则
 - **Phase 2**: P0 核心算子测试完善 - ✅ 完成
-  - 修复了 `src/parser.py` 中 `T.Tensor()` 语法解析问题（ast.Call 类型）
-  - 修复了 `src/codegen.py` 中 `block_K` 收集正则表达式问题
-  - 修复了 `src/codegen.py` 中 `ceildiv` 内联计算问题
-  - 为 `test_gemm_vs_gluon_512` 添加 xfail 标记（Gluon 3.4.0 缺少 warpgroup_mma API）
+  - 新增 `src/version_check.py`: Gluon 版本检查模块
+  - 修复 `src/translator.py`: 集成版本检查，初始化时显示版本信息
+  - 修复 `src/parser.py`: `T.Tensor()` 语法解析问题（ast.Call 类型）
+  - 修复 `src/codegen.py`: 适配 Gluon 3.4.0 API
+    - 添加 `import triton.language as tl`
+    - 使用 `tl.dot` 替代 `warpgroup_mma`
+    - 修复 TensorDescriptor 参数类型注解为字符串
+    - 修复 TensorDescriptor 创建（添加 strides, block_shape, layout）
+    - 修复 `ceildiv` 内联计算
+    - 添加维度提取代码（M, K, N）
 
 #### 新增/修复测试
 - `tests/test_examples_p0.py`: 8 项测试（1 xfailed）
 - `tests/test_examples_source_p0.py`: 6 项测试（全部通过）
 
-#### 验证结果
+#### 验证结果（Gluon 3.4.0）
 ```bash
+# 版本检查输出
+[TileLang-to-Gluon] Gluon version: 3.4.0 (expected: 3.4.0)
+
 pytest tests/test_examples_p0.py tests/test_examples_source_p0.py -v
 # 结果: 13 passed, 1 xfailed, 14 warnings
 

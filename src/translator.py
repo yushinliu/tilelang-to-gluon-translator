@@ -10,6 +10,7 @@ from typing import Optional, Union, List
 from .parser import TileLangParser
 from .transformer import TileLangToGluonTransformer
 from .codegen import GluonCodeGenerator
+from .version_check import log_version_info, check_gluon_version
 
 
 class TileLangToGluonTranslator:
@@ -22,7 +23,8 @@ class TileLangToGluonTranslator:
         max_jobs: int = 8,
         verify: bool = True,
         atol: float = 1e-2,
-        rtol: float = 1e-2
+        rtol: float = 1e-2,
+        check_version: bool = True
     ):
         self.parser = TileLangParser()
         self.transformer = TileLangToGluonTransformer()
@@ -31,6 +33,10 @@ class TileLangToGluonTranslator:
         self.verify = verify
         self.atol = atol
         self.rtol = rtol
+
+        # Check Gluon version
+        if check_version:
+            log_version_info()
 
     def translate(
         self,

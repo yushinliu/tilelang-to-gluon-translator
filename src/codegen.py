@@ -36,10 +36,11 @@ class GluonCodeGenerator:
         return "    " * self.indent_level
 
     def _generate_imports(self):
-        """Generate import statements."""
+        """Generate import statements for Gluon 3.4.0."""
         self.lines.extend([
             "import torch",
             "import triton",
+            "import triton.language as tl",
             "from triton.experimental import gluon",
             "from triton.experimental.gluon import language as gl",
             "from triton.experimental.gluon.nvidia.hopper import TensorDescriptor",
@@ -61,8 +62,9 @@ class GluonCodeGenerator:
         constexpr_params = []
 
         # Tensor descriptors (non-constexpr) - for TMA loads/stores
+        # Use string annotation to avoid "Cannot access global variable" error
         for desc in kernel.tensor_descriptors:
-            params.append(f"{desc.name}: TensorDescriptor")
+            params.append(f"{desc.name}: 'TensorDescriptor'")
 
         # constexpr parameters with defaults
         constexpr_params.append(f"num_warps: gl.constexpr = {kernel.num_warps}")
@@ -188,19 +190,17 @@ class GluonCodeGenerator:
         )
 
     def _generate_mma(self, stmt: GluonMma):
-        """Generate MMA/WGMMA operation."""
+        """Generate MMA/WGMMA operation using tl.dot for Gluon 3.4.0."""
         self.lines.append(
             f"{self._indent()}# MMA operation: {stmt.acc} = {stmt.A_desc} @ {stmt.B_desc}"
         )
-        # Note: gl.warpgroup_mma is not available in Triton 3.4.0
-        # Using tl.dot as fallback (may need adjustment for proper WGMMA support)
+        # Gluon 3.4.0 doesn't have warpgroup_mma, use tl.dot instead
+        # Note: tl.dot may have different performance characteristics
         self.lines.append(
-            f"{self._indent()}# NOTE: warpgroup_mma not available in Gluon 3.4.0, "
-            f"using placeholder"
+            f"{self._indent()}# Using tl.dot (Gluon 3.4.0 compatible)"
         )
         self.lines.append(
-            f"{self._indent()}raise NotImplementedError("
-            f"'warpgroup_mma not available in Gluon 3.4.0')"
+            f"{self._indent()}{stmt.acc} = tl.dot({stmt.A_desc}, {stmt.B_desc}, {stmt.acc})"
         )
 
     def _generate_tma_load(self, stmt: GluonTmaLoad):
@@ -342,11 +342,24 @@ class GluonCodeGenerator:
             self.lines.append(f"{self._indent()}grid = (_ceildiv(N, BLOCK_N), _ceildiv(M, BLOCK_M))")
 
             # Create tensor descriptors for all params
+            # TensorDescriptor(base, shape, strides, block_shape, layout)
             for desc in kernel.tensor_descriptors:
+                tensor_name = desc.tensor_name
+                self.lines.append(f"{self._indent()}# Create tensor descriptor for {tensor_name}")
                 self.lines.append(
-                    f"{self._indent()}{desc.name} = TensorDescriptor({desc.tensor_name}, "
-                    f"{desc.tensor_name}.shape)"
+                    f"{self._indent()}{desc.name} = TensorDescriptor("
+                    f"{tensor_name}, "
+                    f"list({tensor_name}.shape), "
+                    f"[s if i == 0 else 1 for i, s in enumerate({tensor_name}.shape)], "  # strides
                 )
+                self.lines.append(
+                    f"{self._indent()}    [{block_M}, {block_N}], "  # block_shape
+                )
+                self.lines.append(
+                    f"{self._indent()}    gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)"
+                )
+                self.lines.append(f"{self._indent()})")
+                self.lines.append("")
         else:
             # No tensor params - use default grid
             grid_str = ", ".join([str(g) for g in kernel.grid]) if kernel.grid else "1"

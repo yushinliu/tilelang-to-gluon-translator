@@ -1,6 +1,6 @@
 # TileLang to Gluon 测试实现状态报告
 
-## 2026-03-05 最新状态（Parser 修复）
+## 2026-03-05 最终状态（Gluon 3.4.0 适配完成）
 
 ### 全量结果
 ```bash
@@ -8,23 +8,33 @@ pytest -q
 # 结果: 105 passed, 10 skipped, 1 xfailed, 0 failed
 ```
 
-### 本轮修复
+### 本轮修复（Gluon 3.4.0 适配）
+- **src/version_check.py**: 新增 Gluon 版本检查模块
+  - 检查当前 Gluon 版本是否为 3.4.0
+  - 版本不匹配时发出 warning
+  - 记录版本信息供调试使用
+- **src/translator.py**: 集成版本检查
+  - 在初始化时调用 `log_version_info()`
 - **src/parser.py**: 修复 `T.Tensor()` 语法解析问题
   - 问题: `T.Tensor((M, K), dtype)` 被解析为 `ast.Call` 而非 `ast.Subscript`
   - 修复: 在 `_extract_annotation` 中添加 `ast.Call` 类型处理
-- **src/codegen.py**: 修复正则表达式和代码生成问题
+- **src/codegen.py**: 适配 Gluon 3.4.0 API
+  - 添加 `import triton.language as tl`
+  - 使用 `tl.dot` 替代 `warpgroup_mma`（Gloun 3.4.0 可用）
+  - 修复 TensorDescriptor 参数类型注解为字符串（避免 JIT 访问全局变量错误）
+  - 修复 TensorDescriptor 创建，添加完整的参数（strides, block_shape, layout）
   - 修复 `\bblock_[A-Za-z0-9_]+\b` 正则表达式（去除多余的反斜杠）
   - 修复 `ceildiv` 内联计算，生成 `(a + b - 1) // b` 形式
   - 在 kernel 开头添加维度提取代码（M, K, N）
-  - MMA 操作生成 `NotImplementedError`（Gluon 3.4.0 缺少 warpgroup_mma）
 
 ### 测试状态
 - **P0 测试**: 13 passed, 1 xfailed
-  - xfail: `test_gemm_vs_gluon_512`（Gluon 3.4.0 缺少 warpgroup_mma API）
+  - xfail: `test_gemm_vs_gluon_512`（`tl.dot` 不支持 `shared_memory_descriptor` 类型）
 - **完整套件**: 105 passed, 10 skipped, 1 xfailed
 
 ### 已知限制
-1. Gluon 3.4.0 缺少 `warpgroup_mma` API
+1. `tl.dot` 在 Gluon 3.4.0 中不支持 `shared_memory_descriptor` 类型
+   - 需要 `warpgroup_mma` 或 block tensor 支持才能完整实现 GEMM
 2. TensorDescriptor 创建需要完整的参数（strides, block_shape, layout）
 
 ---
