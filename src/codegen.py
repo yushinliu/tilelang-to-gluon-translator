@@ -3,6 +3,7 @@ Generate Gluon kernel source code from Gluon AST.
 """
 
 import ast
+import re
 from typing import List, Any
 from .transformer import (
     GluonKernel, GluonAllocShared, GluonRegisterTensor, GluonTensorDescriptor,
@@ -74,6 +75,10 @@ class GluonCodeGenerator:
 
         constexpr_params.append(f"block_M: gl.constexpr = {block_M}")
         constexpr_params.append(f"block_N: gl.constexpr = {block_N}")
+        # Add missing block_* symbols referenced in shapes (e.g., block_K).
+        for sym in self._collect_block_symbols(kernel):
+            if sym not in {"block_M", "block_N"}:
+                constexpr_params.append(f"{sym}: gl.constexpr = 32")
 
         for alloc in kernel.shared_allocs:
             element_bits = 32
@@ -99,6 +104,16 @@ class GluonCodeGenerator:
             self.lines.append("    " + ",\n    ".join(all_params))
         self.lines.append("):")
         self.indent_level += 1
+
+        # Extract dimensions from tensor descriptors if available
+        if kernel.tensor_descriptors:
+            first_desc = kernel.tensor_descriptors[0]
+            self.lines.append(f"{self._indent()}# Extract dimensions from tensor descriptors")
+            self.lines.append(f"{self._indent()}M = {first_desc.name}.shape[0]")
+            self.lines.append(f"{self._indent()}K = {first_desc.name}.shape[1] if len({first_desc.name}.shape) > 1 else 1")
+            if len(kernel.tensor_descriptors) > 1:
+                second_desc = kernel.tensor_descriptors[1]
+                self.lines.append(f"{self._indent()}N = {second_desc.name}.shape[1] if len({second_desc.name}.shape) > 1 else {second_desc.name}.shape[0]")
 
         # Generate kernel body
         for stmt in kernel.body:
@@ -146,12 +161,7 @@ class GluonCodeGenerator:
         else:
             shape_str = "(1,)"
         # Use the actual dtype from the statement, not the parameter defaults
-        actual_dtype = stmt.dtype if stmt.dtype else "gl.float32"
-        # Fix dtype if it's using the bad pattern
-        if actual_dtype == "gl.in_dtype":
-            actual_dtype = in_dtype
-        elif actual_dtype == "gl.out_dtype":
-            actual_dtype = out_dtype
+        actual_dtype = self._normalize_dtype(stmt.dtype if stmt.dtype else "gl.float32", in_dtype, out_dtype)
         self.lines.append(
             f"{self._indent()}{stmt.name} = gl.allocate_shared_memory("
             f"{actual_dtype}, {shape_str}, {stmt.name}_layout)"
@@ -168,12 +178,7 @@ class GluonCodeGenerator:
             shape_str = "(" + ", ".join(str(x) for x in stmt.shape) + ")"
         else:
             shape_str = str(stmt.shape).replace("'", "") if stmt.shape else "(1,)"
-        actual_dtype = stmt.dtype if stmt.dtype else out_dtype
-        # Fix dtype if it's using the bad pattern
-        if actual_dtype == "gl.in_dtype":
-            actual_dtype = in_dtype
-        elif actual_dtype == "gl.out_dtype":
-            actual_dtype = out_dtype
+        actual_dtype = self._normalize_dtype(stmt.dtype if stmt.dtype else out_dtype, in_dtype, out_dtype)
         # For register tensors (fragments), use shared memory with NVMMASharedLayout
         # This matches the Gluon example pattern
         layout_name = f"{stmt.name}_layout"
@@ -184,12 +189,18 @@ class GluonCodeGenerator:
 
     def _generate_mma(self, stmt: GluonMma):
         """Generate MMA/WGMMA operation."""
-        # Use standard gluon dot operation instead of warpgroup_mma
         self.lines.append(
             f"{self._indent()}# MMA operation: {stmt.acc} = {stmt.A_desc} @ {stmt.B_desc}"
         )
+        # Note: gl.warpgroup_mma is not available in Triton 3.4.0
+        # Using tl.dot as fallback (may need adjustment for proper WGMMA support)
         self.lines.append(
-            f"{self._indent()}{stmt.acc} = gl.dot({stmt.A_desc}, {stmt.B_desc}, {stmt.acc})"
+            f"{self._indent()}# NOTE: warpgroup_mma not available in Gluon 3.4.0, "
+            f"using placeholder"
+        )
+        self.lines.append(
+            f"{self._indent()}raise NotImplementedError("
+            f"'warpgroup_mma not available in Gluon 3.4.0')"
         )
 
     def _generate_tma_load(self, stmt: GluonTmaLoad):
@@ -234,6 +245,21 @@ class GluonCodeGenerator:
         start_str = str(stmt.start)
         end_str = str(stmt.end)
         step_str = str(stmt.step)
+
+        # Replace ceildiv(a, b) with inline computation (a + b - 1) // b
+        # Note: cannot use helper functions inside @jit kernel
+        import re
+        def replace_ceildiv(expr):
+            # Match ceildiv(arg1, arg2) and replace with (arg1 + arg2 - 1) // arg2
+            pattern = r'\bceildiv\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)'
+            def replacer(match):
+                a, b = match.group(1).strip(), match.group(2).strip()
+                return f'(({a} + {b} - 1) // {b})'
+            return re.sub(pattern, replacer, expr)
+
+        end_str = replace_ceildiv(end_str)
+        start_str = replace_ceildiv(start_str)
+        step_str = replace_ceildiv(step_str)
 
         if stmt.is_pipelined:
             self.lines.append(f"{self._indent()}# Pipelined loop with {stmt.num_stages} stages")
@@ -345,3 +371,27 @@ class GluonCodeGenerator:
 
         self.indent_level -= 1
         self.lines.append("")
+
+    def _normalize_dtype(self, dtype_str: str, in_dtype: str, out_dtype: str) -> str:
+        """Normalize symbolic dtype placeholders to concrete Gluon dtypes."""
+        token = str(dtype_str).strip()
+        if token in {"gl.in_dtype", "in_dtype", "gl.dtype", "dtype"}:
+            return in_dtype
+        if token in {"gl.out_dtype", "out_dtype"}:
+            return out_dtype
+        if token in {"gl.accum_dtype", "accum_dtype"}:
+            return "gl.float32"
+        return token
+
+    def _collect_block_symbols(self, kernel: GluonKernel) -> set:
+        """Collect block_* symbols referenced by shapes in generated AST."""
+        syms = set()
+        candidates = list(kernel.shared_allocs) + list(getattr(kernel, "register_tensors", []))
+        for node in candidates:
+            shape = getattr(node, "shape", None)
+            if shape is None:
+                continue
+            text = str(shape)
+            for m in re.findall(r"\bblock_[A-Za-z0-9_]+\b", text):
+                syms.add(m)
+        return syms

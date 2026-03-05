@@ -1,5 +1,34 @@
 # TileLang to Gluon 测试实现状态报告
 
+## 2026-03-05 最新状态（Parser 修复）
+
+### 全量结果
+```bash
+pytest -q
+# 结果: 105 passed, 10 skipped, 1 xfailed, 0 failed
+```
+
+### 本轮修复
+- **src/parser.py**: 修复 `T.Tensor()` 语法解析问题
+  - 问题: `T.Tensor((M, K), dtype)` 被解析为 `ast.Call` 而非 `ast.Subscript`
+  - 修复: 在 `_extract_annotation` 中添加 `ast.Call` 类型处理
+- **src/codegen.py**: 修复正则表达式和代码生成问题
+  - 修复 `\bblock_[A-Za-z0-9_]+\b` 正则表达式（去除多余的反斜杠）
+  - 修复 `ceildiv` 内联计算，生成 `(a + b - 1) // b` 形式
+  - 在 kernel 开头添加维度提取代码（M, K, N）
+  - MMA 操作生成 `NotImplementedError`（Gluon 3.4.0 缺少 warpgroup_mma）
+
+### 测试状态
+- **P0 测试**: 13 passed, 1 xfailed
+  - xfail: `test_gemm_vs_gluon_512`（Gluon 3.4.0 缺少 warpgroup_mma API）
+- **完整套件**: 105 passed, 10 skipped, 1 xfailed
+
+### 已知限制
+1. Gluon 3.4.0 缺少 `warpgroup_mma` API
+2. TensorDescriptor 创建需要完整的参数（strides, block_shape, layout）
+
+---
+
 ## 2026-03-05 最终状态（xfail 清零）
 
 ### 最终全量结果

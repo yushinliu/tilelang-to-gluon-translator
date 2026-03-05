@@ -29,6 +29,7 @@ class GluonKernelCache:
 
     def __init__(self, cache_dir: Optional[Union[str, Path]] = None):
         self.memory_cache: Dict[str, Any] = {}
+        self.cache_version = "v2"
         if cache_dir is None:
             self.cache_dir = Path.home() / ".cache" / "tilelang-to-gluon"
         else:
@@ -37,7 +38,8 @@ class GluonKernelCache:
 
     def _get_hash(self, source_code: str) -> str:
         """Generate hash for source code."""
-        return hashlib.sha256(source_code.encode()).hexdigest()[:16]
+        payload = f"{self.cache_version}:{source_code}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     def get(self, source_code: str) -> Optional[Any]:
         """Get cached kernel if exists."""
@@ -313,7 +315,7 @@ class TileLangGluonWrapper:
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
                 # The launcher doesn't have the _kernel suffix
-                if not node.name.endswith('_kernel'):
+                if not node.name.endswith('_kernel') and not node.name.startswith('_'):
                     launcher_name = node.name
                     break
 

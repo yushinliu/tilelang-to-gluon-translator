@@ -169,6 +169,18 @@ class TileLangParser:
                         if len(elts) >= 2:
                             result["shape"] = self._extract_value(elts[0])
                             result["dtype"] = self._extract_dtype(elts[1])
+        elif isinstance(annotation, ast.Call):
+            # Handle T.Tensor((M, K), dtype) which is parsed as ast.Call
+            if isinstance(annotation.func, ast.Attribute):
+                if annotation.func.attr == "Tensor":
+                    result["type"] = "Tensor"
+                    # Extract shape and dtype from arguments
+                    if annotation.args:
+                        # First arg is shape
+                        result["shape"] = self._extract_value(annotation.args[0])
+                        # Second arg is dtype (if present)
+                        if len(annotation.args) >= 2:
+                            result["dtype"] = self._extract_dtype(annotation.args[1])
         return result
 
     def _extract_dtype(self, node: ast.AST) -> str:
