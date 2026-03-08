@@ -8,7 +8,7 @@ from typing import List, Dict, Optional, Any, Union
 
 from .parser import (
     TileLangKernel, AllocShared, AllocFragment, AllocLocal,
-    CopyOp, GemmOp, ClearOp, ParallelLoop, PipelinedLoop, SerialLoop
+    CopyOp, GemmOp, ClearOp, AtomicAddOp, ParallelLoop, PipelinedLoop, SerialLoop
 )
 
 
@@ -51,19 +51,26 @@ class GluonMma:
 
 @dataclass
 class GluonTmaLoad:
-    """Gluon TMA async load."""
+    """Gluon TMA async load or pointer mode load."""
     desc: str
     offsets: List[Any]
     barrier: str
     smem: str
+    # Pointer mode fields (optional)
+    src_tensor: Optional[str] = None
+    src_indices: Optional[List[Any]] = None
+    dst_tensor: Optional[str] = None
 
 
 @dataclass
 class GluonTmaStore:
-    """Gluon TMA async store."""
+    """Gluon TMA async store or pointer mode store."""
     desc: str
     offsets: List[Any]
     smem: str
+    # Pointer mode fields (optional)
+    dst_tensor: Optional[str] = None
+    dst_indices: Optional[List[Any]] = None
 
 
 @dataclass
@@ -107,6 +114,22 @@ class GluonClear:
 
 
 @dataclass
+class GluonLocalCopy:
+    """Copy between local/shared/register values inside the kernel."""
+    src: str
+    dst: str
+
+
+@dataclass
+class GluonAtomicAdd:
+    """Atomic add into global memory."""
+    target: str
+    value: str
+    target_indices: List[Any] = field(default_factory=list)
+    value_indices: List[Any] = field(default_factory=list)
+
+
+@dataclass
 class GluonProgramId:
     """Gluon program ID access."""
     axis: int
@@ -130,7 +153,7 @@ class GluonKernel:
 GluonStmt = Union[
     GluonAllocShared, GluonRegisterTensor, GluonTensorDescriptor,
     GluonMma, GluonTmaLoad, GluonTmaStore, GluonBarrier, GluonBarrierInit,
-    GluonBarrierWait, GluonLoop, GluonClear, GluonProgramId
+    GluonBarrierWait, GluonLoop, GluonClear, GluonLocalCopy, GluonAtomicAdd, GluonProgramId
 ]
 
 
@@ -197,6 +220,9 @@ class TileLangToGluonTransformer:
         gluon_kernel.out_dtype = out_dtype
         self.current_kernel = gluon_kernel
 
+        for axis, var_name in enumerate(kernel.block_vars):
+            gluon_kernel.body.append(GluonProgramId(axis=axis, var_name=var_name))
+
         # Create tensor descriptors for input/output tensors
         for param in kernel.params:
             if param.get("annotation", {}).get("type") == "Tensor":
@@ -219,7 +245,41 @@ class TileLangToGluonTransformer:
                 else:
                     gluon_kernel.body.append(gluon_stmts)
 
+        self._populate_kernel_metadata(gluon_kernel)
+
         return gluon_kernel
+
+    def _populate_kernel_metadata(self, kernel: GluonKernel) -> None:
+        """Infer block sizes and dtypes from parsed allocations when available."""
+        block_m = getattr(kernel, "block_M", None)
+        block_n = getattr(kernel, "block_N", None)
+        block_k = getattr(kernel, "block_K", None)
+
+        for alloc in kernel.shared_allocs + kernel.register_tensors:
+            shape = getattr(alloc, "shape", None) or []
+            if len(shape) >= 2:
+                first, second = shape[0], shape[1]
+                if block_m in (None, 32) and isinstance(first, int):
+                    block_m = first
+                if block_k in (None, 32) and isinstance(second, int):
+                    block_k = second
+            if alloc.name.startswith("B_") and len(shape) >= 2:
+                second = shape[1]
+                if block_n in (None, 32) and isinstance(second, int):
+                    block_n = second
+            if alloc.name.startswith("C_") and len(shape) >= 2:
+                first, second = shape[0], shape[1]
+                if block_m in (None, 32) and isinstance(first, int):
+                    block_m = first
+                if block_n in (None, 32) and isinstance(second, int):
+                    block_n = second
+
+        if block_m is not None:
+            kernel.block_M = block_m
+        if block_n is not None:
+            kernel.block_N = block_n
+        if block_k is not None:
+            kernel.block_K = block_k
 
     def _transform_params(self, params: List[Dict]) -> List[Dict]:
         """Transform kernel parameters."""
@@ -259,6 +319,8 @@ class TileLangToGluonTransformer:
             return self._transform_copy(stmt)
         elif isinstance(stmt, GemmOp):
             return self._transform_gemm(stmt)
+        elif isinstance(stmt, AtomicAddOp):
+            return self._transform_atomic_add(stmt)
         elif isinstance(stmt, ClearOp):
             return self._transform_clear(stmt)
         elif isinstance(stmt, ParallelLoop):
@@ -306,8 +368,11 @@ class TileLangToGluonTransformer:
             shape = [stmt.shape]
         dtype = self._map_dtype(stmt.dtype)
 
-        # Use NVMMADistributedLayout for accumulators
-        layout = self._infer_mma_layout(shape, dtype)
+        # 2D/3D fragments are typically MMA accumulators; scalar/vector fragments stay blocked.
+        if len(shape) >= 2:
+            layout = self._infer_mma_layout(shape, dtype)
+        else:
+            layout = self._infer_blocked_layout(shape, dtype)
 
         reg_tensor = GluonRegisterTensor(
             name=stmt.name,
@@ -355,26 +420,33 @@ class TileLangToGluonTransformer:
                 f"rank={len(shape)})")
 
     def _infer_mma_layout(self, shape: List[int], dtype: str) -> str:
-        """Infer layout for MMA operations (accumulators) - use shared memory layout."""
-        # Use NVMMASharedLayout which works with gl.allocate_shared_memory
-        base_dtype = self._get_base_dtype(dtype)
-        element_bits = 16 if base_dtype in ["float16", "bfloat16"] else 32
+        """Infer MMA accumulator layout for fragment tensors."""
+        num_warps = getattr(self.current_kernel, "num_warps", 4)
         rank = len(shape) if shape else 2
-        return (f"gl.NVMMASharedLayout("
-                f"swizzle_byte_width=128, "
-                f"element_bitwidth={element_bits}, "
-                f"rank={rank})")
+        if rank == 2:
+            return (
+                "gl.NVMMADistributedLayout("
+                f"version=[2, 0], warps_per_cta=[{num_warps}, 1], instr_shape=[16, 8])"
+            )
+        if rank == 3:
+            return (
+                "gl.NVMMADistributedLayout("
+                f"version=[2, 0], warps_per_cta=[{num_warps}, 1, 1], instr_shape=[1, 16, 8])"
+            )
+        return self._infer_blocked_layout(shape, dtype)
 
     def _infer_blocked_layout(self, shape: List[int], dtype: str) -> str:
-        """Infer layout for general register tensors - use shared memory layout."""
-        # Use NVMMASharedLayout which works with gl.allocate_shared_memory
-        base_dtype = self._get_base_dtype(dtype)
-        element_bits = 16 if base_dtype in ["float16", "bfloat16"] else 32
-        rank = len(shape) if shape else 2
-        return (f"gl.NVMMASharedLayout("
-                f"swizzle_byte_width=128, "
-                f"element_bitwidth={element_bits}, "
-                f"rank={rank})")
+        """Infer a simple blocked layout for general register tensors."""
+        num_warps = getattr(self.current_kernel, "num_warps", 4)
+        rank = len(shape) if shape else 1
+        if rank == 1:
+            return f"gl.BlockedLayout([1], [32], [{num_warps}], [0])"
+        if rank == 2:
+            return f"gl.BlockedLayout([1, 1], [1, 32], [{num_warps}, 1], [1, 0])"
+        dims = ", ".join(["1"] * rank)
+        warps = ", ".join([str(num_warps)] + ["1"] * (rank - 1))
+        order = ", ".join(str(i) for i in reversed(range(rank)))
+        return f"gl.BlockedLayout([{dims}], [{dims}], [{warps}], [{order}])"
 
     def _transform_copy(self, stmt: CopyOp) -> Optional[Union[GluonStmt, List[GluonStmt]]]:
         """Transform copy operation to TMA operations."""
@@ -397,12 +469,15 @@ class TileLangToGluonTransformer:
             # Calculate offsets
             offsets = stmt.dst_indices if stmt.dst_indices else [0, 0]
 
-            # TMA load
+            # TMA load (or pointer mode load)
             tma_load = GluonTmaLoad(
                 desc=desc_name,
                 offsets=offsets,
                 barrier=barrier_name,
-                smem=stmt.dst
+                smem=stmt.dst,
+                src_tensor=stmt.src,
+                src_indices=stmt.src_indices,
+                dst_tensor=stmt.dst
             )
             stmts.append(tma_load)
 
@@ -411,12 +486,18 @@ class TileLangToGluonTransformer:
             desc_name = self.buffer_to_descriptor[stmt.dst]
             offsets = stmt.src_indices if stmt.src_indices else [0, 0]
 
+            # TMA store (or pointer mode store)
             tma_store = GluonTmaStore(
                 desc=desc_name,
                 offsets=offsets,
-                smem=stmt.src
+                smem=stmt.src,
+                dst_tensor=stmt.dst,
+                dst_indices=stmt.dst_indices
             )
             stmts.append(tma_store)
+
+        else:
+            return GluonLocalCopy(src=stmt.src, dst=stmt.dst)
 
         # Shared to fragment is handled by MMA operation directly
 
@@ -434,6 +515,15 @@ class TileLangToGluonTransformer:
     def _transform_clear(self, stmt: ClearOp) -> GluonClear:
         """Transform clear operation."""
         return GluonClear(buffer=stmt.buffer, dtype="gl.float32")
+
+    def _transform_atomic_add(self, stmt: AtomicAddOp) -> GluonAtomicAdd:
+        """Transform atomic add operation."""
+        return GluonAtomicAdd(
+            target=stmt.target,
+            value=stmt.value,
+            target_indices=stmt.target_indices or [],
+            value_indices=stmt.value_indices or [],
+        )
 
     def _transform_parallel_loop(self, stmt: ParallelLoop) -> GluonLoop:
         """Transform parallel loop."""

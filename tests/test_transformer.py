@@ -17,7 +17,7 @@ from src.parser import TileLangParser
 from src.transformer import TileLangToGluonTransformer
 from src.transformer import (
     GluonKernel, GluonAllocShared, GluonRegisterTensor,
-    GluonMma, GluonTmaLoad, GluonLoop
+    GluonMma, GluonTmaLoad, GluonLoop, GluonLocalCopy, GluonAtomicAdd, GluonProgramId
 )
 from src.decorator import to_gluon
 
@@ -88,7 +88,7 @@ def test_alloc(A: T.Tensor((1024,), T.float32)):
         assert alloc is not None
         assert alloc.shape == [128, 128]
         assert alloc.dtype == "gl.float32"
-        assert "NVMMASharedLayout" in alloc.layout
+        assert "NVMMADistributedLayout" in alloc.layout
 
     def test_transform_gemm(self):
         """Test transforming GEMM operation."""
@@ -134,6 +134,51 @@ def test_grid(A: T.Tensor((1024, 1024), T.float32)):
 
         # Grid should be computed from block dimensions
         assert len(gluon_kernel.grid) == 2
+
+    def test_transform_local_copy_and_atomic_add(self):
+        """Shared/local copy and atomic add should be preserved as Gluon ops."""
+        source = '''
+@T.prim_func
+def test_copy_atomic(C: T.Tensor((128, 128), T.float32)):
+    with T.Kernel(1, threads=128):
+        tmp = T.alloc_shared([16, 16], T.float32)
+        frag = T.alloc_fragment([16, 16], T.float32)
+        T.copy(frag, tmp)
+        for i, j in T.Parallel(16, 16):
+            T.atomic_add(C[i, j], tmp[i, j])
+'''
+        parser = TileLangParser()
+        transformer = TileLangToGluonTransformer()
+
+        tilelang_kernel = parser.parse(source)
+        gluon_kernel = transformer.transform(tilelang_kernel)
+
+        local_copy = next(stmt for stmt in gluon_kernel.body if isinstance(stmt, GluonLocalCopy))
+        assert local_copy.src == "frag"
+        assert local_copy.dst == "tmp"
+
+        parallel_loop = next(stmt for stmt in gluon_kernel.body if isinstance(stmt, GluonLoop))
+        atomic_add = next(stmt for stmt in parallel_loop.body[0].body if isinstance(stmt, GluonAtomicAdd))
+        assert atomic_add.target == "C"
+        assert atomic_add.value == "tmp"
+
+    def test_transform_emits_program_ids(self):
+        """Kernel launch indices should become explicit Gluon program IDs."""
+        source = '''
+@T.prim_func
+def test_program_ids(A: T.Tensor((1024, 1024), T.float32)):
+    with T.Kernel(4, 5, 6, threads=128) as (bx, by, bz):
+        pass
+'''
+        parser = TileLangParser()
+        transformer = TileLangToGluonTransformer()
+
+        tilelang_kernel = parser.parse(source)
+        gluon_kernel = transformer.transform(tilelang_kernel)
+
+        program_ids = [stmt for stmt in gluon_kernel.body if isinstance(stmt, GluonProgramId)]
+        assert [stmt.var_name for stmt in program_ids] == ["bx", "by", "bz"]
+        assert [stmt.axis for stmt in program_ids] == [0, 1, 2]
 
 
 class TestTransformerDecoratorIntegration:

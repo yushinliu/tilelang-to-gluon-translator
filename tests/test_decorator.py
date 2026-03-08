@@ -78,6 +78,33 @@ class TestToGluonDecorator:
         assert wrapper.source_code is not None
         assert "mock_kernel" in wrapper.source_code
 
+    def test_wrapper_inlines_outer_constants_for_inner_prim_func(self):
+        """Extracted prim_func source should inline simple outer-scope bindings."""
+        def splitk_factory():
+            M, N, K = 256, 256, 256
+            block_M, block_N, block_K = 64, 64, 32
+            split_k = 2
+            splitK = K // split_k
+
+            @T.prim_func
+            def main(
+                A: T.Tensor((M, K), T.float16),
+                B: T.Tensor((N, K), T.float16),
+                C: T.Tensor((M, N), T.float32),
+            ):
+                with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), split_k, threads=128) as (bx, by, bz):
+                    for ko in T.Pipelined(T.ceildiv(splitK, block_K), num_stages=0):
+                        pass
+
+            return main
+
+        wrapper = TileLangGluonWrapper(splitk_factory)
+        assert "256" in wrapper.source_code
+        assert "64" in wrapper.source_code
+        assert "32" in wrapper.source_code
+        assert "2" in wrapper.source_code
+        assert "splitK" not in wrapper.source_code
+
     def test_cache_persistence(self):
         """Test that cache persists across calls."""
         cache = GluonKernelCache()

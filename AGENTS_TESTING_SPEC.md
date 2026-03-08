@@ -14,8 +14,10 @@
 - **准则 5**: **只能通过修改该项目 to_gluon 转换代码**来通过测试
 - **准则 6**: 删除与以上测试不相关的功能和测试
 - **准则 7**: **src 代码中转换的逻辑必须通用**，针对 TileLang 的语法进行转换，而不是针对 elementwise、flashatten 等 kernel 来定制转换逻辑
+- **准则 8**: **测试必须比较 TileLang kernel 和 Gluon kernel 的输出**，而不是与 PyTorch 参考实现比较
 
 ### 2. 精度验证标准
+- **比较对象**: TileLang kernel 输出 vs Gluon kernel 输出（**不是与 PyTorch 比较**）
 - 默认容差: `rtol=1e-2`, `atol=1e-2`
 - FP8 量化场景: `rtol=1e-1`, `atol=1e-1`, `equal_nan=True`
 - 所有验证必须在 GPU 上执行
@@ -57,9 +59,11 @@
 ### P3 - 高级算子（低优先级）
 | 文件路径 | 测试类型 | 当前状态 |
 |---------|---------|---------|
-| `flash_decoding/*.py` | Flash Decoding | ⏳ |
-| `deepseek_mla/*.py` | DeepSeek MLA | ⏳ |
-| `fusedmoe/*.py` | MoE 融合算子 | ⏳ |
+| `flash_decoding/example_gqa_decode.py` | Flash Decoding GQA | ⏳ |
+| `flash_decoding/example_mha_inference.py` | MHA Inference | ⏳ |
+| `deepseek_mla/example_mla_decode.py` | DeepSeek MLA Decode | ⏳ |
+| `deepseek_mla/example_mla_decode_paged.py` | MLA Paged Decode | ⏳ |
+| `fusedmoe/example_fusedmoe_tilelang.py` | MoE 融合算子 | ⏳ |
 
 ## 开发阶段规划
 
@@ -176,6 +180,17 @@
 - 回归测试报告
 - 性能基准报告
 - 更新的文档
+
+### Agent 5: P3 高级算子测试工程师
+**职责**:
+- 实现 P3 级别测试（Flash Decoding, DeepSeek MLA, Fused MoE）
+- 分析复杂算子的 TileLang 语法模式
+- 修复转换器以支持高级特性（如 warp specialization, paged attention）
+
+**输出**:
+- `tests/test_examples_p3.py` 完善
+- 测试通过报告
+- 转换器修复补丁
 
 ## 进展追踪模板
 
@@ -294,7 +309,93 @@ pytest tests/ -v
 1. **Gluon 3.4.0 缺少 warpgroup_mma API**: 当前版本无法执行 GEMM 的 MMA 操作
 2. **TensorDescriptor 创建需要更多参数**: 当前 codegen 生成的 TensorDescriptor 调用缺少 strides, block_shape, layout 参数
 
-#### 下一阶段计划
-- [ ] Phase 3: P1 重要算子测试实现（等待 Gluon API 完善或找到替代方案）
-- [ ] Phase 4: P2 扩展算子测试实现
-- [ ] 探索使用 `tl.dot` 替代 `warpgroup_mma` 的可行性
+### 2026-03-06 进展（当前状态审核）
+
+#### 当前测试状态
+```bash
+pytest -q
+# 结果: 105 passed, 10 skipped, 1 xfailed, 32 warnings
+```
+
+**详细分解**:
+- **P0 核心算子**: 6 passed, 1 xfailed
+  - xfail: `test_gemm_vs_gluon_512` (tl.dot 不支持 shared_memory_descriptor)
+- **P1 重要算子**: 11 passed
+- **P2 扩展算子**: 10 passed
+- **P3 高级算子**: 未开始实现
+- **其他测试**: 78 passed, 10 skipped
+
+#### 已完成工作
+- ✅ P0 核心算子测试（elementwise, gemm, rms_norm）
+- ✅ P1 重要算子测试（flash_attention, splitk, streamk）
+- ✅ P2 扩展算子测试（fp8, dequantize, grouped_gemm）
+- ✅ 基础设施通用性审计
+- ✅ Gluon 3.4.0 API 适配
+
+#### 下一阶段计划（P3 高级算子）
+1. **Phase 6: P3 高级算子实现**
+   - Flash Decoding 系列转换
+   - DeepSeek MLA 系列转换
+   - Fused MoE 转换
+2. **修复测试比较逻辑（高优先级）**
+   - P1/P2 测试当前与 PyTorch 比较，需要改为 TileLang vs Gluon 比较
+   - 需要修复 codegen 生成的 Gluon kernel 参数格式问题
+3. **完善 xfailed 测试**
+   - 解决 `test_gemm_vs_gluon_512` 的 shared_memory_descriptor 问题
+4. **扩展测试覆盖**
+   - 添加更多 TileLang examples 源文件测试
+
+#### 测试准则变更记录
+**2026-03-06**: 更新测试准则第 8 条
+- **旧**: 测试可以与 PyTorch 参考实现比较精度
+- **新**: **测试必须比较 TileLang kernel 和 Gluon kernel 的输出**（不是与 PyTorch 比较）
+- **状态**:
+  - ✅ P0 测试已符合新准则（部分测试直接比较 TileLang vs Gluon）
+  - ⏳ P1/P2 测试暂时保持与 PyTorch 比较（等待 codegen 修复）
+  - **注意**: 尝试修改 P1/P2 测试为 TileLang vs Gluon 比较时遇到 codegen 参数生成问题，已回滚
+
+### 2026-03-06 进展（Codegen 修复）
+
+#### 修复内容
+1. **修复 tensor 参数检测问题**
+   - 文件: `src/codegen.py`
+   - 问题: 检查 `p.get('annotation', {}).get('type') == 'Tensor'` 失败
+   - 修复: 改为检查 `p.get('type') == 'tensor_descriptor'`（与 transformer 输出一致）
+
+2. **修复共享内存布局常量生成**
+   - 文件: `src/codegen.py`
+   - 问题: pointer mode 下未生成 `A_shared_layout` 等常量
+   - 修复: 将布局常量生成移至 `if not self.use_pointer_mode` 外部，两种模式都生成
+
+#### 待解决问题
+- **TMA vs Pointer mode 混淆**: Codegen 在 pointer mode 下仍生成 `tma.async_copy_*` 调用，但需要改用 `tl.load`/`tl.store`
+- **影响**: `test_gemm_vs_gluon_512` 仍为 xfail，因为生成的代码尝试使用未定义的 `A_desc` TensorDescriptor
+
+#### P3 Kernel 模式审计报告
+**审核时间**: 2026-03-06
+
+| TileLang 特性 | Flash Decoding | DeepSeek MLA | Fused MoE | 当前支持状态 |
+|--------------|----------------|--------------|-----------|-------------|
+| `T.use_swizzle()` | ✅ | ✅ | ❓ | ❌ 未支持 |
+| `T.if_then_else()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.reduce_max()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.reduce_sum()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.fill()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.clear()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.copy()` 部分切片 | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.Pipelined()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.Parallel()` | ✅ | ✅ | ❓ | ✅ 已支持 |
+| `T.serial()` | ✅ | ❌ | ❓ | ❌ 未支持 |
+| `T.alloc_var()` | ❌ | ✅ | ❓ | ❌ 未支持 |
+| Multi-kernel 文件 | ✅ (split/combine) | ✅ (split/combine) | ❓ | ⚠️ 需特殊处理 |
+| `T.mbarrier_*` | ❌ | ❌ | ❓ | ❌ 未支持 |
+
+**主要发现**:
+1. **Flash Decoding**: 使用 split-K 策略，包含两个 kernel（split + combine），需要 serial loop 支持
+2. **DeepSeek MLA**: 使用 MLA (Multi-head Latent Attention) 模式，有 `main_split` 和 `main_no_split` 两个变体，使用 `T.alloc_var()` 分配标量变量
+3. **Fused MoE**: 尚未详细审计，但预期需要 warp specialization 或复杂的任务调度
+
+**实施建议**:
+- 优先实现 `T.serial()` 和 `T.alloc_var()` 支持（Flash Decoding 和 DeepSeek MLA 必需）
+- 考虑如何处理一个文件包含多个 kernel 的情况
+- 需要测试 split-K 和 multi-kernel 组合场景

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.parser import (
     TileLangParser, TileLangKernel, AllocShared, AllocFragment,
-    CopyOp, GemmOp, ClearOp, ParallelLoop, PipelinedLoop
+    CopyOp, GemmOp, ClearOp, AtomicAddOp, ParallelLoop, PipelinedLoop
 )
 from src.decorator import to_gluon
 
@@ -39,6 +39,21 @@ def simple_kernel(A: T.Tensor((1024,), T.float32)):
         assert kernel.name == "simple_kernel"
         assert len(kernel.params) == 1
         assert kernel.thread_count == 128
+        assert kernel.block_vars == ["bx"]
+
+    def test_parse_kernel_block_vars(self):
+        """Test parsing block program IDs from T.Kernel context."""
+        source = '''
+@T.prim_func
+def kernel_3d(A: T.Tensor((1024,), T.float32)):
+    with T.Kernel(4, 5, 6, threads=128) as (bx, by, bz):
+        pass
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        assert kernel.block_dims == [4, 5, 6]
+        assert kernel.block_vars == ["bx", "by", "bz"]
 
     def test_parse_alloc_shared(self):
         """Test parsing shared memory allocation."""
@@ -201,6 +216,41 @@ def test_pipelined(A: T.Tensor((1024, 1024), T.float16)):
         assert loop.var == "k"
         assert loop.extent == 32
         assert loop.num_stages == 2
+
+    def test_parse_atomic_add(self):
+        """Test parsing atomic add operation."""
+        source = '''
+@T.prim_func
+def test_atomic_add(C: T.Tensor((128, 128), T.float32)):
+    with T.Kernel(1, threads=128):
+        tmp = T.alloc_shared([16, 16], T.float32)
+        for i, j in T.Parallel(16, 16):
+            T.atomic_add(C[i, j], tmp[i, j])
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        loop = next(stmt for stmt in kernel.body if isinstance(stmt, ParallelLoop))
+        atomic_add = next(stmt for stmt in loop.body if isinstance(stmt, AtomicAddOp))
+        assert atomic_add.target == "C"
+        assert atomic_add.value == "tmp"
+        assert atomic_add.target_indices == ["i", "j"]
+        assert atomic_add.value_indices == ["i", "j"]
+
+    def test_parse_numeric_floor_div_expression(self):
+        """Numeric floor division should be folded instead of emitted as invalid text."""
+        source = '''
+@T.prim_func
+def test_floor_div(A: T.Tensor((1024, 1024), T.float16)):
+    with T.Kernel(1, threads=128):
+        for k in T.Pipelined(T.ceildiv(256 // 2, 32), num_stages=0):
+            pass
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        loop = next(stmt for stmt in kernel.body if isinstance(stmt, PipelinedLoop))
+        assert loop.extent == 4
 
 
 class TestParserDecoratorIntegration:

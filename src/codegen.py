@@ -8,16 +8,22 @@ from typing import List, Any
 from .transformer import (
     GluonKernel, GluonAllocShared, GluonRegisterTensor, GluonTensorDescriptor,
     GluonMma, GluonTmaLoad, GluonTmaStore, GluonBarrier, GluonBarrierInit,
-    GluonBarrierWait, GluonLoop, GluonClear, GluonProgramId
+    GluonBarrierWait, GluonLoop, GluonClear, GluonLocalCopy, GluonAtomicAdd, GluonProgramId
 )
 
 
 class GluonCodeGenerator:
     """Generates Gluon kernel source code from Gluon AST."""
 
-    def __init__(self):
+    def __init__(self, use_pointer_mode: bool = False):
         self.indent_level = 0
         self.lines = []
+        # Use pointer mode (tl.load/tl.store) instead of TensorDescriptor mode
+        # This must be opt-in because the default translator path is intended to
+        # emit Gluon descriptor/TMA-style code rather than Triton pointer code.
+        self.use_pointer_mode = use_pointer_mode
+        # Track tensor parameters for pointer mode
+        self.tensor_params = []
 
     def generate(self, kernel: GluonKernel) -> str:
         """Generate Gluon kernel source code."""
@@ -61,10 +67,21 @@ class GluonCodeGenerator:
         params = []
         constexpr_params = []
 
-        # Tensor descriptors (non-constexpr) - for TMA loads/stores
-        # Use string annotation to avoid "Cannot access global variable" error
-        for desc in kernel.tensor_descriptors:
-            params.append(f"{desc.name}: 'TensorDescriptor'")
+        if self.use_pointer_mode:
+            # Pointer mode: use raw pointers and dimensions
+            # Note: transformer converts 'annotation' to 'type', so check 'type' field
+            self.tensor_params = [p for p in kernel.params if p.get('type') == 'tensor_descriptor']
+            for param in self.tensor_params:
+                params.append(f"{param['name']}_ptr: tl.pointer_type")
+            # Add dimension parameters
+            if self.tensor_params:
+                params.append("M: tl.constexpr")
+                params.append("N: tl.constexpr")
+                params.append("K: tl.constexpr")
+        else:
+            # TensorDescriptor mode (for TMA loads/stores)
+            for desc in kernel.tensor_descriptors:
+                params.append(f"{desc.name}: 'TensorDescriptor'")
 
         # constexpr parameters with defaults
         constexpr_params.append(f"num_warps: gl.constexpr = {kernel.num_warps}")
@@ -72,6 +89,7 @@ class GluonCodeGenerator:
         # Extract constants from kernel or use defaults
         block_M = kernel.block_M if hasattr(kernel, 'block_M') and kernel.block_M else 32
         block_N = kernel.block_N if hasattr(kernel, 'block_N') and kernel.block_N else 32
+        block_K = kernel.block_K if hasattr(kernel, 'block_K') and kernel.block_K else 32
         in_dtype = kernel.in_dtype if hasattr(kernel, 'in_dtype') and kernel.in_dtype else "gl.float32"
         out_dtype = kernel.out_dtype if hasattr(kernel, 'out_dtype') and kernel.out_dtype else "gl.float32"
 
@@ -82,13 +100,14 @@ class GluonCodeGenerator:
             if sym not in {"block_M", "block_N"}:
                 constexpr_params.append(f"{sym}: gl.constexpr = 32")
 
+        # Add shared memory layouts for both pointer and TensorDescriptor modes
+        # (needed for allocate_shared_memory calls in kernel body)
         for alloc in kernel.shared_allocs:
             element_bits = 32
             if 'float16' in alloc.dtype or 'bfloat16' in alloc.dtype:
                 element_bits = 16
             rank = len(alloc.shape) if alloc.shape else 2
             constexpr_params.append(f"{alloc.name}_layout: gl.constexpr = gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth={element_bits}, rank={rank})")
-        # Also add layouts for register tensors (used as shared memory in Gluon)
         for reg in getattr(kernel, 'register_tensors', []):
             element_bits = 32
             if 'float16' in reg.dtype or 'bfloat16' in reg.dtype:
@@ -106,16 +125,6 @@ class GluonCodeGenerator:
             self.lines.append("    " + ",\n    ".join(all_params))
         self.lines.append("):")
         self.indent_level += 1
-
-        # Extract dimensions from tensor descriptors if available
-        if kernel.tensor_descriptors:
-            first_desc = kernel.tensor_descriptors[0]
-            self.lines.append(f"{self._indent()}# Extract dimensions from tensor descriptors")
-            self.lines.append(f"{self._indent()}M = {first_desc.name}.shape[0]")
-            self.lines.append(f"{self._indent()}K = {first_desc.name}.shape[1] if len({first_desc.name}.shape) > 1 else 1")
-            if len(kernel.tensor_descriptors) > 1:
-                second_desc = kernel.tensor_descriptors[1]
-                self.lines.append(f"{self._indent()}N = {second_desc.name}.shape[1] if len({second_desc.name}.shape) > 1 else {second_desc.name}.shape[0]")
 
         # Generate kernel body
         for stmt in kernel.body:
@@ -148,6 +157,10 @@ class GluonCodeGenerator:
             self._generate_loop(stmt, in_dtype=in_dtype, out_dtype=out_dtype)
         elif isinstance(stmt, GluonClear):
             self._generate_clear(stmt)
+        elif isinstance(stmt, GluonLocalCopy):
+            self._generate_local_copy(stmt)
+        elif isinstance(stmt, GluonAtomicAdd):
+            self._generate_atomic_add(stmt)
         elif isinstance(stmt, GluonProgramId):
             self._generate_program_id(stmt)
 
@@ -304,6 +317,24 @@ class GluonCodeGenerator:
         """Generate clear operation."""
         self.lines.append(f"{self._indent()}{stmt.buffer} = 0")
 
+    def _generate_local_copy(self, stmt: GluonLocalCopy):
+        """Generate in-kernel local/shared/register copy."""
+        self.lines.append(f"{self._indent()}{stmt.dst} = {stmt.src}")
+
+    def _generate_atomic_add(self, stmt: GluonAtomicAdd):
+        """Generate atomic add into global memory."""
+        if stmt.target_indices:
+            target_indices = ", ".join(str(i) for i in stmt.target_indices)
+            target_expr = f"{stmt.target}[{target_indices}]"
+        else:
+            target_expr = stmt.target
+        if stmt.value_indices:
+            value_indices = ", ".join(str(i) for i in stmt.value_indices)
+            value_expr = f"{stmt.value}[{value_indices}]"
+        else:
+            value_expr = stmt.value
+        self.lines.append(f"{self._indent()}tl.atomic_add({target_expr}, {value_expr})")
+
     def _generate_program_id(self, stmt: GluonProgramId):
         """Generate program ID access."""
         self.lines.append(
@@ -315,11 +346,13 @@ class GluonCodeGenerator:
         # Extract dimensions from kernel or use defaults
         block_M = kernel.block_M if hasattr(kernel, 'block_M') and kernel.block_M else 32
         block_N = kernel.block_N if hasattr(kernel, 'block_N') and kernel.block_N else 32
+        block_K = kernel.block_K if hasattr(kernel, 'block_K') and kernel.block_K else 32
 
         # Define constant values extracted from kernel (before launcher)
         self.lines.append(f"# Kernel constants for {kernel.name}")
         self.lines.append(f"BLOCK_M = {block_M}")
         self.lines.append(f"BLOCK_N = {block_N}")
+        self.lines.append(f"BLOCK_K = {block_K}")
         self.lines.append("")
 
         # Launcher function takes torch.Tensor arguments (generate this first so it's detected as the launcher)
@@ -332,51 +365,66 @@ class GluonCodeGenerator:
             self.lines.append(f"def {kernel.name}():")
         self.indent_level += 1
 
-        # Generate tensor descriptor creation from input tensors
-        # Use shape from the first tensor to calculate grid
         if tensor_params:
             first_tensor = tensor_params[0]['name']
             # Calculate grid based on tensor shape
             self.lines.append(f"{self._indent()}M = {first_tensor}.shape[0] if {first_tensor}.dim() > 0 else 1")
             self.lines.append(f"{self._indent()}N = {first_tensor}.shape[1] if {first_tensor}.dim() > 1 else 1")
-            self.lines.append(f"{self._indent()}grid = (_ceildiv(N, BLOCK_N), _ceildiv(M, BLOCK_M))")
+            if len(tensor_params) >= 2:
+                second_tensor = tensor_params[1]['name']
+                self.lines.append(f"{self._indent()}K = {second_tensor}.shape[0] if {second_tensor}.dim() > 0 else 1")
+            else:
+                self.lines.append(f"{self._indent()}K = M")  # Assume square matrix
+            if kernel.grid:
+                self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)})")
+            else:
+                self.lines.append(f"{self._indent()}grid = (_ceildiv(N, BLOCK_N), _ceildiv(M, BLOCK_M))")
 
-            # Create tensor descriptors for all params
-            # TensorDescriptor(base, shape, strides, block_shape, layout)
-            for desc in kernel.tensor_descriptors:
-                tensor_name = desc.tensor_name
-                self.lines.append(f"{self._indent()}# Create tensor descriptor for {tensor_name}")
+            if self.use_pointer_mode:
+                # Pass pointers and dimensions to kernel
+                # Note: kernel expects {name}_ptr parameters
+                ptr_args = ", ".join([f"{p['name']}" for p in tensor_params])
+                dim_args = "M=M, N=N, K=K"
+                all_args = ", ".join([ptr_args, dim_args])
                 self.lines.append(
-                    f"{self._indent()}{desc.name} = TensorDescriptor("
-                    f"{tensor_name}, "
-                    f"list({tensor_name}.shape), "
-                    f"[s if i == 0 else 1 for i, s in enumerate({tensor_name}.shape)], "  # strides
+                    f"{self._indent()}{kernel.name}_kernel[grid]({all_args})"
                 )
+            else:
+                # TensorDescriptor mode
+                for desc in kernel.tensor_descriptors:
+                    tensor_name = desc.tensor_name
+                    self.lines.append(f"{self._indent()}# Create tensor descriptor for {tensor_name}")
+                    self.lines.append(
+                        f"{self._indent()}{desc.name} = TensorDescriptor("
+                        f"{tensor_name}, "
+                        f"list({tensor_name}.shape), "
+                        f"[s if i == 0 else 1 for i, s in enumerate({tensor_name}.shape)], "  # strides
+                    )
+                    self.lines.append(
+                        f"{self._indent()}    [{block_M}, {block_N}], "  # block_shape
+                    )
+                    self.lines.append(
+                        f"{self._indent()}    gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)"
+                    )
+                    self.lines.append(f"{self._indent()})")
+                    self.lines.append("")
+
+                # Generate kernel launch for TensorDescriptor mode
+                desc_args = ", ".join([d.name for d in kernel.tensor_descriptors])
+                shared_layout_args = ", ".join([f"{a.name}_layout={a.layout}" for a in kernel.shared_allocs])
+                reg_layout_args = ", ".join([f"{r.name}_layout={r.layout}" for r in getattr(kernel, 'register_tensors', [])])
+                all_args = ", ".join(filter(None, [desc_args, shared_layout_args, reg_layout_args]))
+
                 self.lines.append(
-                    f"{self._indent()}    [{block_M}, {block_N}], "  # block_shape
+                    f"{self._indent()}{kernel.name}_kernel[grid]({all_args})"
                 )
-                self.lines.append(
-                    f"{self._indent()}    gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2)"
-                )
-                self.lines.append(f"{self._indent()})")
-                self.lines.append("")
         else:
             # No tensor params - use default grid
             grid_str = ", ".join([str(g) for g in kernel.grid]) if kernel.grid else "1"
             self.lines.append(f"{self._indent()}grid = ({grid_str},)")
-
-        # Generate kernel launch
-        desc_args = ", ".join([d.name for d in kernel.tensor_descriptors])
-        shared_layout_args = ", ".join([f"{a.name}_layout={a.layout}" for a in kernel.shared_allocs])
-        # Also include register tensor layouts
-        reg_layout_args = ", ".join([f"{r.name}_layout={r.layout}" for r in getattr(kernel, 'register_tensors', [])])
-        # Barrier constexpr params already have defaults in generated kernel
-        # signature; do not pass them positionally in launcher call.
-        all_args = ", ".join(filter(None, [desc_args, shared_layout_args, reg_layout_args]))
-
-        self.lines.append(
-            f"{self._indent()}{kernel.name}_kernel[grid]({all_args})"
-        )
+            self.lines.append(
+                f"{self._indent()}{kernel.name}_kernel[grid]()"
+            )
 
         # Return output tensors (last param is usually the output)
         if tensor_params:
@@ -408,3 +456,13 @@ class GluonCodeGenerator:
             for m in re.findall(r"\bblock_[A-Za-z0-9_]+\b", text):
                 syms.add(m)
         return syms
+
+    def _format_grid(self, grid: List[Any]) -> str:
+        """Format grid expressions for the host launcher."""
+        rendered = []
+        for dim in grid:
+            expr = str(dim)
+            expr = expr.replace("block_M", "BLOCK_M").replace("block_N", "BLOCK_N").replace("block_K", "BLOCK_K")
+            expr = re.sub(r"\bceildiv\s*\(", "_ceildiv(", expr)
+            rendered.append(expr)
+        return ", ".join(rendered)

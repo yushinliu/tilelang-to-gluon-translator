@@ -58,6 +58,15 @@ class ClearOp:
 
 
 @dataclass
+class AtomicAddOp:
+    """Atomic add operation."""
+    target: str
+    value: str
+    target_indices: Optional[List] = None
+    value_indices: Optional[List] = None
+
+
+@dataclass
 class ParallelLoop:
     """Parallel loop construct."""
     var: str
@@ -91,11 +100,13 @@ class TileLangKernel:
     name: str
     params: List[Dict[str, Any]]
     block_dims: List[Any]
+    block_vars: List[str]
     thread_count: int
     body: List[Any] = field(default_factory=list)
 
 
 Stmt = Union[AllocShared, AllocFragment, AllocLocal, CopyOp, GemmOp,
+             AtomicAddOp,
              ClearOp, ParallelLoop, PipelinedLoop, SerialLoop, ast.AST]
 
 
@@ -130,6 +141,7 @@ class TileLangParser:
             name=node.name,
             params=self._parse_params(node.args),
             block_dims=[],
+            block_vars=[],
             thread_count=128,
             body=[]
         )
@@ -218,6 +230,12 @@ class TileLangParser:
                         self.current_kernel.block_dims = [
                             self._extract_value(arg) for arg in call.args
                         ]
+                        if isinstance(item.optional_vars, ast.Tuple):
+                            self.current_kernel.block_vars = [
+                                elt.id for elt in item.optional_vars.elts if isinstance(elt, ast.Name)
+                            ]
+                        elif isinstance(item.optional_vars, ast.Name):
+                            self.current_kernel.block_vars = [item.optional_vars.id]
                         # Extract thread count from keywords
                         for kw in call.keywords:
                             if kw.arg == "threads":
@@ -330,6 +348,8 @@ class TileLangParser:
                 return self._parse_copy(call)
             elif func_name == "gemm":
                 return self._parse_gemm(call)
+            elif func_name == "atomic_add":
+                return self._parse_atomic_add(call)
             elif func_name == "clear":
                 return self._parse_clear(call)
 
@@ -419,6 +439,27 @@ class TileLangParser:
         buffer = self._extract_value(call.args[0]) if call.args else ""
         return ClearOp(buffer=buffer)
 
+    def _parse_atomic_add(self, call: ast.Call) -> AtomicAddOp:
+        """Parse T.atomic_add() call."""
+        target = self._extract_buffer_ref(call.args[0]) if call.args else ""
+        value = self._extract_buffer_ref(call.args[1]) if len(call.args) > 1 else ""
+
+        target_indices = None
+        value_indices = None
+        if call.args and isinstance(call.args[0], ast.Subscript):
+            target_indices = self._extract_indices(call.args[0])
+        if len(call.args) > 1 and isinstance(call.args[1], ast.Subscript):
+            value_indices = self._extract_indices(call.args[1])
+        elif len(call.args) > 1:
+            value = self._extract_value(call.args[1])
+
+        return AtomicAddOp(
+            target=target,
+            value=value,
+            target_indices=target_indices,
+            value_indices=value_indices,
+        )
+
     def _extract_buffer_ref(self, node: ast.AST) -> str:
         """Extract buffer reference from AST node."""
         if isinstance(node, ast.Name):
@@ -457,6 +498,13 @@ class TileLangParser:
         elif isinstance(node, ast.BinOp):
             left = self._extract_value(node.left)
             right = self._extract_value(node.right)
+            op_map = {
+                ast.Mult: "*",
+                ast.Add: "+",
+                ast.Sub: "-",
+                ast.Div: "/",
+                ast.FloorDiv: "//",
+            }
             # Only evaluate if both operands are numeric
             if isinstance(left, (int, float)) and isinstance(right, (int, float)):
                 if isinstance(node.op, ast.Mult):
@@ -467,8 +515,11 @@ class TileLangParser:
                     return left - right
                 elif isinstance(node.op, ast.Div):
                     return left / right
+                elif isinstance(node.op, ast.FloorDiv):
+                    return left // right
             # Return as string representation for symbolic expressions
-            return f"{left} {type(node.op).__name__.lower()} {right}"
+            op = op_map.get(type(node.op), type(node.op).__name__.lower())
+            return f"{left} {op} {right}"
         elif isinstance(node, ast.Slice):
             # Handle slice notation like 0:128
             lower = self._extract_value(node.lower) if node.lower else 0

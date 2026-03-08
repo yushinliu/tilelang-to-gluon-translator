@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import textwrap
+from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
@@ -157,7 +158,7 @@ class TileLangGluonWrapper:
                 # Extract the inner @T.prim_func kernel from @tilelang.jit wrapper
                 inner_source = self._extract_inner_prim_func(source)
                 if inner_source:
-                    return inner_source
+                    return self._inline_outer_constants(source, inner_source)
                 # If extraction fails, return the full source
                 return source
 
@@ -166,12 +167,13 @@ class TileLangGluonWrapper:
             # Dedent to handle decorated functions
             source = textwrap.dedent(source)
 
+            inner_source = self._extract_inner_prim_func(source)
+            if inner_source:
+                return self._inline_outer_constants(source, inner_source)
+
             # Check if this is a @tilelang.jit wrapped function (from source inspection)
             if self._is_tilelang_jit_wrapper(source):
-                # Extract the inner @T.prim_func kernel
-                inner_source = self._extract_inner_prim_func(source)
-                if inner_source:
-                    return inner_source
+                return source
 
             return source
         except (OSError, TypeError) as e:
@@ -235,6 +237,50 @@ class TileLangGluonWrapper:
             pass
 
         return None
+
+    def _inline_outer_constants(self, outer_source: str, inner_source: str) -> str:
+        """Inline simple outer-scope bindings into the extracted prim_func source."""
+        try:
+            outer_tree = ast.parse(outer_source)
+            outer_func = next((node for node in ast.walk(outer_tree) if isinstance(node, ast.FunctionDef)), None)
+            if outer_func is None:
+                return inner_source
+
+            bindings: Dict[str, ast.AST] = {}
+            for stmt in outer_func.body:
+                if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                    continue
+                target = stmt.targets[0]
+                if isinstance(target, ast.Name):
+                    value = self._replace_bound_names(deepcopy(stmt.value), bindings)
+                    bindings[target.id] = value
+                    continue
+                if isinstance(target, ast.Tuple) and isinstance(stmt.value, ast.Tuple):
+                    values = [self._replace_bound_names(deepcopy(v), bindings) for v in stmt.value.elts]
+                    for name_node, value in zip(target.elts, values):
+                        if isinstance(name_node, ast.Name):
+                            bindings[name_node.id] = value
+
+            if not bindings:
+                return inner_source
+
+            inner_tree = ast.parse(inner_source)
+            inliner = _OuterBindingInliner(bindings)
+            updated_tree = inliner.visit(inner_tree)
+            ast.fix_missing_locations(updated_tree)
+            return ast.unparse(updated_tree)
+        except Exception:
+            return inner_source
+
+    def _replace_bound_names(self, node: ast.AST, bindings: Dict[str, ast.AST]) -> ast.AST:
+        """Recursively substitute previously collected outer bindings."""
+        class _BindingResolver(ast.NodeTransformer):
+            def visit_Name(self, inner_node: ast.Name):
+                if isinstance(inner_node.ctx, ast.Load) and inner_node.id in bindings:
+                    return deepcopy(bindings[inner_node.id])
+                return inner_node
+
+        return _BindingResolver().visit(node)
 
     def _has_t_kernel(self, node: ast.FunctionDef) -> bool:
         """Check if function body contains T.Kernel usage."""
@@ -391,7 +437,8 @@ def to_gluon(
     verify: bool = True,
     atol: float = 1e-2,
     rtol: float = 1e-2,
-    cache_dir: Optional[Union[str, Path]] = None
+    cache_dir: Optional[Union[str, Path]] = None,
+    use_pointer_mode: bool = False  # Default to TMA mode (pointer mode needs more work)
 ) -> Union[Callable, TileLangGluonWrapper]:
     """
     Decorator to automatically translate TileLang kernels to Gluon.
@@ -426,7 +473,14 @@ def to_gluon(
     # Handle both @to_gluon and @to_gluon() syntax
     if func is not None and callable(func):
         # Used as @to_gluon without parentheses
-        return TileLangGluonWrapper(func, max_jobs=max_jobs)
+        translator = TileLangToGluonTranslator(
+            max_jobs=max_jobs,
+            verify=verify,
+            atol=atol,
+            rtol=rtol,
+            use_pointer_mode=use_pointer_mode
+        )
+        return TileLangGluonWrapper(func, translator=translator, max_jobs=max_jobs)
 
     # Used as @to_gluon(...) with parentheses
     def decorator(f: Callable) -> TileLangGluonWrapper:
@@ -434,9 +488,22 @@ def to_gluon(
             max_jobs=max_jobs,
             verify=verify,
             atol=atol,
-            rtol=rtol
+            rtol=rtol,
+            use_pointer_mode=use_pointer_mode
         )
         cache = GluonKernelCache(cache_dir) if cache_dir is not None else GluonKernelCache()
         return TileLangGluonWrapper(f, translator=translator, cache=cache, max_jobs=max_jobs)
 
     return decorator
+
+
+class _OuterBindingInliner(ast.NodeTransformer):
+    """Inline extracted outer-scope bindings into the prim_func AST."""
+
+    def __init__(self, bindings: Dict[str, ast.AST]):
+        self.bindings = bindings
+
+    def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, ast.Load) and node.id in self.bindings:
+            return deepcopy(self.bindings[node.id])
+        return node

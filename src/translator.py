@@ -10,6 +10,7 @@ from typing import Optional, Union, List
 from .parser import TileLangParser
 from .transformer import TileLangToGluonTransformer
 from .codegen import GluonCodeGenerator
+from .codegen_pointer import GluonPointerCodeGenerator
 from .version_check import log_version_info, check_gluon_version
 
 
@@ -24,15 +25,21 @@ class TileLangToGluonTranslator:
         verify: bool = True,
         atol: float = 1e-2,
         rtol: float = 1e-2,
-        check_version: bool = True
+        check_version: bool = True,
+        use_pointer_mode: bool = False
     ):
         self.parser = TileLangParser()
         self.transformer = TileLangToGluonTransformer()
-        self.codegen = GluonCodeGenerator()
+        # Use pointer mode codegen (tl.load/tl.store) or TensorDescriptor mode
+        if use_pointer_mode:
+            self.codegen = GluonPointerCodeGenerator()
+        else:
+            self.codegen = GluonCodeGenerator()
         self.max_jobs = max_jobs
         self.verify = verify
         self.atol = atol
         self.rtol = rtol
+        self.use_pointer_mode = use_pointer_mode
 
         # Check Gluon version
         if check_version:
