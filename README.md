@@ -60,6 +60,19 @@ pip install torch triton
 # Ensure TileLang and Triton are available
 export PYTHONPATH="/mnt/d/yuliu/ws/tilelang:$PYTHONPATH"
 export PYTHONPATH="/mnt/d/yuliu/ws/triton/python:$PYTHONPATH"
+
+# Install the package in editable mode
+pip install -e .
+```
+
+### Build And Install A Wheel
+
+```bash
+# Build a wheel into ./dist
+python -m pip wheel . -w dist --no-deps
+
+# Install the built wheel
+pip install dist/tilelang_to_gluon_translator-0.0.1-py3-none-any.whl
 ```
 
 ## Usage
@@ -70,7 +83,7 @@ Simply replace `@T.prim_func` with `@to_gluon` and call directly:
 
 ```python
 import tilelang.language as T
-from tilelang_to_gluon import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 @to_gluon  # Replace @T.prim_func
 def matmul(
@@ -117,7 +130,7 @@ def my_kernel(...):
 
 ```bash
 # Translate a single file
-python -m src.translator input_tilelang.py -o output_gluon.py
+python -m tilelang_to_gluon_translator.cli input_tilelang.py -o output_gluon.py
 
 # Translate with verification
 python -m src.translator input_tilelang.py --verify

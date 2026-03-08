@@ -29,6 +29,19 @@ pip install torch triton
 # 确保 TileLang 和 Triton 可用
 export PYTHONPATH="/path/to/tilelang:$PYTHONPATH"
 export PYTHONPATH="/path/to/triton/python:$PYTHONPATH"
+
+# 可编辑安装
+pip install -e .
+```
+
+### 构建并安装 whl
+
+```bash
+# 在 ./dist 中构建 wheel
+python -m pip wheel . -w dist --no-deps
+
+# 安装生成的 whl
+pip install dist/tilelang_to_gluon_translator-0.0.1-py3-none-any.whl
 ```
 
 ### 使用方法
@@ -39,7 +52,7 @@ export PYTHONPATH="/path/to/triton/python:$PYTHONPATH"
 
 ```python
 import tilelang.language as T
-from tilelang_to_gluon import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 @to_gluon  # 替换 @T.prim_func
 def matmul(
@@ -109,13 +122,13 @@ translator.translate_directory(
 
 ```bash
 # 翻译单个文件
-python -m src.translator input_tilelang.py -o output_gluon.py
+python -m tilelang_to_gluon_translator.cli input_tilelang.py -o output_gluon.py
 
 # 翻译整个目录
-python -m src.translator input_dir/ -o output_dir/
+python -m tilelang_to_gluon_translator.cli input_dir/ -o output_dir/
 
 # 控制并行编译任务数
-python -m src.translator input.py --max-jobs 8
+python -m tilelang_to_gluon_translator.cli input.py --max-jobs 8
 ```
 
 ## 项目结构

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tilelang-to-gluon-translator"
-version = "0.1.0"
+version = "0.0.1"
 description = "A translator from TileLang kernels to Triton Gluon kernels"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,6 +28,11 @@ dependencies = [
     "torch>=2.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/yushinliu/tilelang-to-gluon-translator"
+Repository = "https://github.com/yushinliu/tilelang-to-gluon-translator"
+Issues = "https://github.com/yushinliu/tilelang-to-gluon-translator/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
@@ -38,11 +43,12 @@ dev = [
 ]
 
 [project.scripts]
-tilelang-to-gluon = "src.translator:main"
+tilelang-to-gluon = "tilelang_to_gluon_translator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "tilelang_to_gluon_translator*"]
+exclude = ["tests*", "src.__pycache__*", "tilelang_to_gluon_translator.__pycache__*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
