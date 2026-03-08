@@ -7,19 +7,20 @@ Includes:
 - GPU execution tests for transformed kernels
 """
 
+import ast
 import pytest
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.parser import TileLangParser
-from src.transformer import TileLangToGluonTransformer
-from src.transformer import (
+from tilelang_to_gluon_translator.parser import TileLangParser
+from tilelang_to_gluon_translator.transformer import TileLangToGluonTransformer
+from tilelang_to_gluon_translator.transformer import (
     GluonKernel, GluonAllocShared, GluonRegisterTensor,
     GluonMma, GluonTmaLoad, GluonLoop, GluonLocalCopy, GluonAtomicAdd, GluonProgramId
 )
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 
 class TestTileLangToGluonTransformer:
@@ -179,6 +180,26 @@ def test_program_ids(A: T.Tensor((1024, 1024), T.float32)):
         program_ids = [stmt for stmt in gluon_kernel.body if isinstance(stmt, GluonProgramId)]
         assert [stmt.var_name for stmt in program_ids] == ["bx", "by", "bz"]
         assert [stmt.axis for stmt in program_ids] == [0, 1, 2]
+
+    def test_transform_preserves_raw_ast_top_level_and_serial_loop(self):
+        """Non-TileLang Python statements should survive transformation."""
+        source = '''
+@T.prim_func
+def test_raw_ast(A: T.Tensor((1024,), T.float32)):
+    with T.Kernel(1, threads=128):
+        tid = 0
+        for i in T.serial(4):
+            acc = i
+'''
+        parser = TileLangParser()
+        transformer = TileLangToGluonTransformer()
+
+        tilelang_kernel = parser.parse(source)
+        gluon_kernel = transformer.transform(tilelang_kernel)
+
+        assert any(isinstance(stmt, ast.Assign) for stmt in gluon_kernel.body)
+        serial_loop = next(stmt for stmt in gluon_kernel.body if isinstance(stmt, GluonLoop))
+        assert any(isinstance(stmt, ast.Assign) for stmt in serial_loop.body)
 
 
 class TestTransformerDecoratorIntegration:

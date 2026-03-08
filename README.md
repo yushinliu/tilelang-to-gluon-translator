@@ -72,7 +72,7 @@ pip install -e .
 python -m pip wheel . -w dist --no-deps
 
 # Install the built wheel
-pip install dist/tilelang_to_gluon_translator-0.0.1-py3-none-any.whl
+pip install dist/tilelang_to_gluon_translator-0.0.2-py3-none-any.whl
 ```
 
 ## Usage
@@ -132,20 +132,17 @@ def my_kernel(...):
 # Translate a single file
 python -m tilelang_to_gluon_translator.cli input_tilelang.py -o output_gluon.py
 
-# Translate with verification
-python -m src.translator input_tilelang.py --verify
-
 # Translate directory
-python -m src.translator input_dir/ -o output_dir/
+python -m tilelang_to_gluon_translator.cli input_dir/ -o output_dir/
 
 # Control parallel compilation jobs (max 8)
-python -m src.translator input.py --max-jobs 8
+python -m tilelang_to_gluon_translator.cli input.py --max-jobs 8
 ```
 
 ### Python API
 
 ```python
-from translator import TileLangToGluonTranslator
+from tilelang_to_gluon_translator import TileLangToGluonTranslator
 
 translator = TileLangToGluonTranslator(max_jobs=8)
 

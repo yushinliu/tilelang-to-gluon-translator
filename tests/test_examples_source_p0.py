@@ -15,7 +15,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 
 EXAMPLES_ROOT = Path("/mnt/d/yuliu/ws/tilelang/examples")

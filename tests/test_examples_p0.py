@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 
 class TestGemm:
@@ -117,9 +117,8 @@ class TestGemm:
         verify_tensors(ref_c, ref_torch, rtol=1e-2, atol=1.5e-1)
 
     @pytest.mark.gpu
-    @pytest.mark.xfail(reason="tl.dot doesn't support shared_memory_descriptor in Gluon 3.4.0")
     def test_gemm_vs_gluon_512(self, device, verify_tensors):
-        """Test GEMM conversion path using tl.dot (Gluon 3.4.0 compatible)."""
+        """Test GEMM conversion path using Triton 3.6 pointer-mode Gluon codegen."""
         import tilelang
         import tilelang.language as T
 
@@ -160,8 +159,6 @@ class TestGemm:
         ref_c = tilelang_kernel(a, b)
         gluon_c = torch.zeros_like(ref_c)
 
-        # tl.dot in Gluon 3.4.0 doesn't support shared_memory_descriptor
-        # This requires either warpgroup_mma or proper block tensor support
         gluon_kernel(a, b, gluon_c)
         verify_tensors(gluon_c, ref_c, rtol=1e-2, atol=1e-1)
 

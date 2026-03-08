@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.decorator import to_gluon, GluonKernelCache
+from tilelang_to_gluon_translator import to_gluon, GluonKernelCache
 
 
 def test_basic_decorator():
@@ -113,7 +113,7 @@ def demonstrate_usage():
 
     print("✓ 基本用法: @to_gluon")
     print("""
-from tilelang_to_gluon import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 @to_gluon
 def my_kernel(A, B, C):
@@ -196,7 +196,7 @@ def main():
         print("  ✓ 包装器属性")
         print()
         print("使用方法:")
-        print("  from tilelang_to_gluon import to_gluon")
+        print("  from tilelang_to_gluon_translator import to_gluon")
         print()
         print("  @to_gluon")
         print("  def kernel(A: T.Tensor(...), B: T.Tensor(...)):")

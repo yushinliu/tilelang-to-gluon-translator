@@ -1,11 +1,7 @@
-"""Public package facade for the TileLang to Gluon translator."""
+"""TileLang to Gluon translator public package."""
 
-from src import (
-    GluonKernelCache,
-    TileLangGluonWrapper,
-    TileLangToGluonTranslator,
-    to_gluon,
-)
+from .translator import TileLangToGluonTranslator
+from .decorator import to_gluon, TileLangGluonWrapper, GluonKernelCache
 
 __all__ = [
     "TileLangToGluonTranslator",

@@ -14,11 +14,11 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.parser import (
+from tilelang_to_gluon_translator.parser import (
     TileLangParser, TileLangKernel, AllocShared, AllocFragment,
-    CopyOp, GemmOp, ClearOp, AtomicAddOp, ParallelLoop, PipelinedLoop
+    CopyOp, GemmOp, ClearOp, AtomicAddOp, ParallelLoop, PipelinedLoop, SerialLoop
 )
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 
 class TestTileLangParser:
@@ -216,6 +216,23 @@ def test_pipelined(A: T.Tensor((1024, 1024), T.float16)):
         assert loop.var == "k"
         assert loop.extent == 32
         assert loop.num_stages == 2
+
+    def test_parse_single_arg_serial_loop_defaults_start_to_zero(self):
+        """T.serial(x) should parse like range(0, x)."""
+        source = '''
+@T.prim_func
+def test_serial(A: T.Tensor((1024,), T.float32)):
+    with T.Kernel(1, threads=128):
+        for i in T.serial(8):
+            tmp = i
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        loop = next(stmt for stmt in kernel.body if isinstance(stmt, SerialLoop))
+        assert loop.start == 0
+        assert loop.end == 8
+        assert any(isinstance(stmt, ast.Assign) for stmt in loop.body)
 
     def test_parse_atomic_add(self):
         """Test parsing atomic add operation."""

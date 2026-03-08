@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator import to_gluon
 
 
 def _assert_plain_kernel_rejected(fn, *args):
@@ -84,7 +84,7 @@ def simple_kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.float32)
         A_shared = T.alloc_shared([128], T.float32)
         T.copy(A[0:128], A_shared)
 '''
-        from src.translator import TileLangToGluonTranslator
+        from tilelang_to_gluon_translator import TileLangToGluonTranslator
 
         translator = TileLangToGluonTranslator(max_jobs=8, verify=False)
         code = translator.translate(source)
@@ -129,7 +129,7 @@ class TestExamplesStrictCompatibility:
             kernel(a, b, out)
 
     @pytest.mark.gpu
-    def test_gemm_kernel_raises_on_current_codegen_limit(self, device):
+    def test_gemm_kernel_auto_falls_back_to_pointer_mode(self, device):
         @tilelang.jit(out_idx=[-1])
         def gemm_const():
             M, N, K = 128, 128, 128
@@ -156,6 +156,8 @@ class TestExamplesStrictCompatibility:
         a = torch.randn(128, 128, device=device).half()
         b = torch.randn(128, 128, device=device).half()
         out = torch.zeros(128, 128, device=device).half()
+        ref = gemm_const()(a, b)
 
-        with pytest.raises(Exception):
-            kernel(a, b, out)
+        kernel(a, b, out)
+        assert torch.allclose(out, ref, rtol=1e-2, atol=1e-1)
+        assert kernel.translator.use_pointer_mode is True

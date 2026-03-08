@@ -41,7 +41,7 @@ pip install -e .
 python -m pip wheel . -w dist --no-deps
 
 # 安装生成的 whl
-pip install dist/tilelang_to_gluon_translator-0.0.1-py3-none-any.whl
+pip install dist/tilelang_to_gluon_translator-0.0.2-py3-none-any.whl
 ```
 
 ### 使用方法
@@ -98,7 +98,7 @@ def my_kernel(...):
 #### 方式 2: 使用翻译器 API
 
 ```python
-from tilelang_to_gluon import TileLangToGluonTranslator
+from tilelang_to_gluon_translator import TileLangToGluonTranslator
 
 translator = TileLangToGluonTranslator(max_jobs=8)
 
@@ -210,7 +210,7 @@ python examples/verify_decorator.py
 ### 清除缓存
 
 ```python
-from tilelang_to_gluon import GluonKernelCache
+from tilelang_to_gluon_translator import GluonKernelCache
 
 cache = GluonKernelCache()
 

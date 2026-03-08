@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.translator import TileLangToGluonTranslator
+from tilelang_to_gluon_translator import TileLangToGluonTranslator
 
 
 # TileLang elementwise kernel

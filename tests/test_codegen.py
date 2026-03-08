@@ -13,11 +13,11 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.parser import TileLangParser
-from src.transformer import TileLangToGluonTransformer
-from src.codegen import GluonCodeGenerator
-from src.codegen_pointer import GluonPointerCodeGenerator
-from src.decorator import to_gluon
+from tilelang_to_gluon_translator.parser import TileLangParser
+from tilelang_to_gluon_translator.transformer import TileLangToGluonTransformer
+from tilelang_to_gluon_translator.codegen import GluonCodeGenerator
+from tilelang_to_gluon_translator.codegen_pointer import GluonPointerCodeGenerator
+from tilelang_to_gluon_translator import to_gluon
 
 
 class TestGluonCodeGenerator:
@@ -280,6 +280,29 @@ def test_copy_layout(A: T.Tensor((128, 128), T.float16)):
 
         assert "C_shared = gl.convert_layout(C_local, gl.BlockedLayout" in code
         assert "C_shared = C_local" not in code
+
+    def test_codegen_emits_preserved_raw_ast_at_top_level_and_in_serial_loops(self):
+        """Preserved Python AST statements should make it into generated Gluon source."""
+        generator = GluonCodeGenerator()
+
+        source = '''
+@T.prim_func
+def test_raw_ast_codegen(A: T.Tensor((1024,), T.float32)):
+    with T.Kernel(1, threads=128):
+        tid = 0
+        for i in T.serial(4):
+            acc = i
+'''
+        parser = TileLangParser()
+        transformer = TileLangToGluonTransformer()
+
+        tilelang_kernel = parser.parse(source)
+        gluon_kernel = transformer.transform(tilelang_kernel)
+        code = generator.generate(gluon_kernel)
+
+        assert "tid = 0" in code
+        assert "for i in range(0, 4, 1):" in code
+        assert "acc = i" in code
 
 
 class TestCodegenDecoratorIntegration:

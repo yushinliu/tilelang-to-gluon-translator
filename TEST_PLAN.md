@@ -1,5 +1,66 @@
 # TileLang to Gluon 测试计划
 
+## 2026-03-09 发布门槛更新
+
+### 发布前置条件
+- 在准备 `0.0.2` 之前，必须先验证 `/mnt/d/yuliu/ws/tilelang/examples` 下所有测试入口都能：
+  - 成功转换到 Gluon
+  - 在 GPU 上执行
+  - 通过精度验证
+- 如果任一 example 仍依赖“预期失败”或“手写 PyTorch 替身”路径，则不能视为达到发布条件
+
+### 当前状态
+- 当前已覆盖子集在 Triton `3.6.0` + GPU 上实测全绿：
+  - `55 passed`
+- 但 examples 全量覆盖远未完成，因此当前阶段仍然是“继续开发和验证”，不是“准备发布”
+
+### 开发策略调整
+- 原计划偏向按 example 目录推进
+- 现在改为“先补通用 lowering 能力，再回填 examples 覆盖”，因为未覆盖 examples 中已经暴露出一批重复的共性缺口：
+  - `T.get_thread_binding(...)`
+  - `T.vectorized(...)`
+  - `T.alloc_var(...)`
+  - TileLang 标量表达式/赋值/增量赋值 lowering
+  - `T.if_then_else(...)`
+  - `T.reduce_absmax(...)`
+  - `T.attr(...)` / `T.comm_reducer(...)` / `T.tvm_thread_allreduce(...)`
+  - `warp_specialize`
+
+### 当前分层优先级
+1. **P0: 通用 lowering 补齐**
+   - `get_thread_binding` / 线程维度语义
+   - serial/vectorized loop lowering
+   - 标量表达式、raw AST、dtype cast、下标读写
+   - `alloc_var` / `if_then_else`
+2. **P1: 轻量 SIMT / reduction examples 回填**
+   - `gemv`
+   - `cast`
+   - `topk`
+   - `hadamard_transform`
+3. **P2: 复杂 reduction / allreduce / attention 族**
+   - `linear_attention`
+   - `flash_decoding`
+   - `attention_sink`
+   - `blocksparse_attention`
+4. **P3: 高级调度 / warp-specialized / 大模型特化算子**
+   - `warp_specialize`
+   - `fusedmoe`
+   - `deepseek_*`
+
+### 近期已完成的基础修复
+- Triton/Gluon 目标版本切换到 `3.6.0`
+- 删除自定义 `NVMMADistributedLayout`
+- GEMM 默认路径增加受限 pointer-mode fallback
+- 修复 `T.serial(x)` 解析为 `range(0, x)`
+- 修复 serial loop 与顶层 raw AST 语句丢失问题
+
+### 近期执行顺序
+1. 为 parser / transformer / codegen 新增回归测试并保持已覆盖 GPU 子集全绿
+2. 补 `get_thread_binding` 与基础 SIMT lowering
+3. 用 `gemv` 做第一批真实转换验证
+4. 再扩展到 `cast` / `topk` 等轻量未覆盖目录
+5. 最后再评估 attention / warp-specialize / deepseek 系列
+
 ## 目标
 将 TileLang examples 中的测例添加到 tilelang-to-gluon-translator 测试套件中，转换为 Gluon 后验证精度一致性。
 
@@ -78,6 +139,25 @@ def test_example_gemm():
 1. **max_jobs <= 8** - 并行编译限制
 2. **GPU 必须可用** - 所有 kernel 测试必须在 GPU 上运行
 3. **精度要求** - rtol=1e-2, atol=1e-2 (与原始 TileLang 测试一致)
+
+## v0.0.2 发布修复计划
+
+### 背景
+- 已发布的 `v0.0.1` wheel 暴露了内部顶层包 `src`
+- `tilelang_to_gluon_translator` 只是转发壳，公开对象的 `__module__` 仍指向 `src.*`
+- 这会让发布 API 与仓库实现细节强耦合，也会增加与外部同名 `src` 包冲突的风险
+
+### 修复目标
+1. wheel 只发布 `tilelang_to_gluon_translator` 公共包
+2. 所有公开导入、CLI 入口和运行时代码都不再依赖 `src.*`
+3. 增加发布 smoke test，验证公开对象来自 `tilelang_to_gluon_translator.*`
+4. 用隔离安装验证 wheel，确认安装后没有顶层 `src` 包
+
+### 执行顺序
+1. 迁移运行时代码到 `tilelang_to_gluon_translator/`
+2. 更新测试、示例和 README 中的导入路径
+3. 调整打包配置并发布 `0.0.2`
+4. 构建 wheel 后做隔离安装验证
 
 ## Task 分解
 

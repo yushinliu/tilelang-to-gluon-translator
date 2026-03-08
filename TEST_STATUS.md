@@ -1,5 +1,97 @@
 # TileLang to Gluon 测试实现状态报告
 
+## 2026-03-09 当前状态（Triton 3.6.0，仍未满足 0.0.2 发布门槛）
+
+### 当前结论
+- 当前不能准备发布 `0.0.2`
+- 原因不是已覆盖集回归失败，而是 `/mnt/d/yuliu/ws/tilelang/examples` 的“所有测试都能成功转换并在 GPU 上通过精度验证”这一门槛尚未达成
+
+### Triton 3.6.0 / Gluon 适配状态
+- 已确认 Triton `3.6.0` 的 Gluon 正式提供：
+  - `gl.NVMMADistributedLayout`
+  - `gl.DotOperandLayout`
+  - `gl.NVMMASharedLayout`
+- 项目已移除自定义 `NVMMADistributedLayout` fallback，并对齐 Triton 3.6.0 的正式接口
+- GEMM 在 Triton 3.6.0 下的真实可用路径目前是 pointer mode
+- 默认 TMA/shared-memory dot 路径仍有已知限制，因此 `@to_gluon` 对普通 GEMM 增加了受限自动 fallback
+
+### 当前 GPU 实测
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q tests/test_examples_p0.py tests/test_examples_p1.py tests/test_examples_p2.py tests/test_examples_source_p0.py tests/test_accuracy_regression.py
+# 结果: 55 passed, 32 warnings in 29.94s
+```
+
+### 当前真实覆盖范围
+- 已覆盖并在 GPU 上验证的 examples 目录：
+  - `blocksparse_gemm`
+  - `convolution`
+  - `dequantize_gemm`
+  - `elementwise`
+  - `flash_attention`
+  - `gemm`
+  - `gemm_fp8`
+  - `gemm_splitk`
+  - `gemm_streamk`
+  - `norm`
+
+### 仍未满足发布门槛的原因
+- `/mnt/d/yuliu/ws/tilelang/examples` 下共有 32 个 `test_*.py` 入口，当前只覆盖其中一部分
+- 仍未覆盖的目录包括但不限于：
+  - `analyze`
+  - `attention_sink`
+  - `blocksparse_attention`
+  - `cast`
+  - `deepseek_*`
+  - `flash_decoding`
+  - `fusedmoe`
+  - `gemm_sp`
+  - `gemv`
+  - `linear_attention`
+  - `topk`
+  - `warp_specialize`
+
+### 2026-03-09 本轮新增修复
+- 修复 `T.serial(x)` 解析语义，按 `range(0, x)` 处理
+- 修复 serial / pipelined / 普通 for 中未识别原始 AST 语句被静默丢弃的问题
+- 修复顶层 raw AST 在 codegen 阶段被吞掉的问题
+- 新增对应单测回归：
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q tests/test_parser.py tests/test_transformer.py tests/test_codegen.py
+# 结果: 36 passed, 8 skipped in 8.16s
+```
+
+### 对未覆盖 examples 的最新判断
+- `gemv` 调研表明，阻塞已经不是简单 parser/codegen bug，而是更深一层的 SIMT lowering 缺失
+- `get_thread_binding`、`vectorized`、`alloc_var`、`if_then_else`、`reduce_absmax`、`comm_reducer`、`warp_specialize` 等语义在未覆盖 examples 中大量存在
+- 因此后续工作不应再按目录机械补测试，而应先补齐通用 lowering 能力，再逐组回填 example 覆盖
+
+## 2026-03-08 v0.0.1 wheel 发布验证
+
+### 验证范围
+- 阅读 `README.md`、`README_CN.md`、`AGENTS_TESTING_SPEC.md`、`TEST_PLAN.md`
+- 下载 GitHub Releases 上的首个 wheel：`v0.0.1`
+- 解包并做安装前检查，确认发布物的顶层包布局
+
+### 发现的问题
+- `v0.0.1` wheel 同时发布了 `src/` 和 `tilelang_to_gluon_translator/`
+- 公开包 `tilelang_to_gluon_translator` 只是对 `src` 的薄封装
+- CLI 入口 `tilelang_to_gluon_translator.cli:main` 继续转发到 `src.translator:main`
+- 这意味着：
+  - 发布 API 泄漏内部实现细节
+  - 公开对象的 `__module__` 不稳定，仍落在 `src.*`
+  - wheel 安装环境会多出一个不应公开承诺的顶层 `src` 包
+
+### 对下个版本（0.0.2）的结论
+- 该问题属于发布结构缺陷，不是 release asset 缺失
+- 下一版本应以包结构修复为第一优先级，再继续功能开发
+- 发布验收新增一条：隔离安装 wheel 后，只允许暴露 `tilelang_to_gluon_translator` 顶层包
+
+### 0.0.2 修复执行项
+- 将运行时代码切换到 `tilelang_to_gluon_translator/` 作为唯一公开包
+- 更新测试、示例、README 中的导入路径
+- 收紧 `pyproject.toml` 打包范围，排除 `src*`
+- 新增 packaging smoke test，校验公开对象不再来自 `src.*`
+
 ## 2026-03-05 最终状态（Gluon 3.4.0 适配完成）
 
 ### 全量结果
