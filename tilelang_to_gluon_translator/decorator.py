@@ -31,7 +31,7 @@ class GluonKernelCache:
 
     def __init__(self, cache_dir: Optional[Union[str, Path]] = None):
         self.memory_cache: Dict[str, Any] = {}
-        self.cache_version = "v3"
+        self.cache_version = "v12"
         if cache_dir is None:
             self.cache_dir = Path.home() / ".cache" / "tilelang-to-gluon"
         else:

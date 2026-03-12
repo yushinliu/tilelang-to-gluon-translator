@@ -48,6 +48,8 @@ class GluonMma:
     B_desc: str
     acc: str
     is_async: bool = True
+    trans_A: bool = False
+    trans_B: bool = False
 
 
 @dataclass
@@ -60,6 +62,7 @@ class GluonTmaLoad:
     # Pointer mode fields (optional)
     src_tensor: Optional[str] = None
     src_indices: Optional[List[Any]] = None
+    src_extents: Optional[List[Any]] = None
     dst_tensor: Optional[str] = None
 
 
@@ -72,6 +75,7 @@ class GluonTmaStore:
     # Pointer mode fields (optional)
     dst_tensor: Optional[str] = None
     dst_indices: Optional[List[Any]] = None
+    dst_extents: Optional[List[Any]] = None
 
 
 @dataclass
@@ -531,6 +535,7 @@ class TileLangToGluonTransformer:
                 smem=stmt.dst,
                 src_tensor=stmt.src,
                 src_indices=stmt.src_indices,
+                src_extents=stmt.src_extents,
                 dst_tensor=stmt.dst
             )
             stmts.append(tma_load)
@@ -546,7 +551,8 @@ class TileLangToGluonTransformer:
                 offsets=offsets,
                 smem=stmt.src,
                 dst_tensor=stmt.dst,
-                dst_indices=stmt.dst_indices
+                dst_indices=stmt.dst_indices,
+                dst_extents=stmt.dst_extents,
             )
             stmts.append(tma_store)
 
@@ -563,7 +569,9 @@ class TileLangToGluonTransformer:
             A_desc=stmt.A,
             B_desc=stmt.B,
             acc=stmt.C,
-            is_async=True
+            is_async=True,
+            trans_A=stmt.trans_A,
+            trans_B=stmt.trans_B,
         )
 
     def _transform_clear(self, stmt: ClearOp) -> GluonClear:

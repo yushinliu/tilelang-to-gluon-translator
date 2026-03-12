@@ -39,6 +39,8 @@ class CopyOp:
     dst: str
     src_indices: Optional[List] = None
     dst_indices: Optional[List] = None
+    src_extents: Optional[List] = None
+    dst_extents: Optional[List] = None
 
 
 @dataclass
@@ -698,16 +700,27 @@ class TileLangParser:
         # Extract indices if present
         src_indices = None
         dst_indices = None
+        src_extents = None
+        dst_extents = None
         if call.args and isinstance(call.args[0], ast.Subscript):
             src_indices = self._extract_indices(call.args[0])
         elif call.args and isinstance(call.args[0], ast.Call):
             src_indices = self._extract_region_indices(call.args[0])
+            src_extents = self._extract_region_extents(call.args[0])
         if len(call.args) > 1 and isinstance(call.args[1], ast.Subscript):
             dst_indices = self._extract_indices(call.args[1])
         elif len(call.args) > 1 and isinstance(call.args[1], ast.Call):
             dst_indices = self._extract_region_indices(call.args[1])
+            dst_extents = self._extract_region_extents(call.args[1])
 
-        return CopyOp(src=src, dst=dst, src_indices=src_indices, dst_indices=dst_indices)
+        return CopyOp(
+            src=src,
+            dst=dst,
+            src_indices=src_indices,
+            dst_indices=dst_indices,
+            src_extents=src_extents,
+            dst_extents=dst_extents,
+        )
 
     def _parse_gemm(self, call: ast.Call) -> GemmOp:
         """Parse T.gemm() call."""
@@ -719,9 +732,9 @@ class TileLangParser:
         trans_B = True  # default in TileLang
 
         for kw in call.keywords:
-            if kw.arg == "trans_A":
+            if kw.arg in {"trans_A", "transpose_A"}:
                 trans_A = self._extract_value(kw.value)
-            elif kw.arg == "trans_B":
+            elif kw.arg in {"trans_B", "transpose_B"}:
                 trans_B = self._extract_value(kw.value)
 
         return GemmOp(A=A, B=B, C=C, trans_A=trans_A, trans_B=trans_B)
@@ -783,6 +796,14 @@ class TileLangParser:
         if isinstance(region_ref, ast.Subscript):
             return self._extract_indices(region_ref)
         return []
+
+    def _extract_region_extents(self, node: ast.Call) -> List[Any]:
+        """Extract region extents from T.region(buffer[idx...], mode, extents...)."""
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "region":
+            return []
+        if len(node.args) <= 2:
+            return []
+        return [self._extract_value(arg) for arg in node.args[2:]]
 
     def _extract_buffer_names(self, args: List[ast.AST]) -> List[str]:
         """Extract buffer names from T.reads/T.writes arguments."""

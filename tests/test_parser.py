@@ -122,6 +122,26 @@ def test_copy(A: T.Tensor((1024,), T.float32)):
         assert copy.src == "A"
         assert copy.dst == "shared"
 
+    def test_parse_region_copy_extents(self):
+        """Lowered T.region copies should preserve base indices and extents."""
+        source = '''
+@T.prim_func
+def test_region_copy(Q_handle: T.handle, S_handle: T.handle):
+    Q = T.match_buffer(Q_handle, (1, 64, 1, 32), "float16")
+    S = T.match_buffer(S_handle, (64, 32), "float16")
+    with T.block("root"):
+        T.copy(T.region(Q[0, 16, 0, 0], 1, 1, 32, 1, 32), T.region(S[0, 0], 2, 32, 32))
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        copy = next(stmt for stmt in kernel.body if isinstance(stmt, CopyOp))
+        assert copy.src == "Q"
+        assert copy.dst == "S"
+        assert copy.src_indices == [0, 16, 0, 0]
+        assert copy.src_extents == [1, 32, 1, 32]
+        assert copy.dst_extents == [32, 32]
+
     def test_parse_gemm(self):
         """Test parsing GEMM operation."""
         source = '''
@@ -146,6 +166,28 @@ def test_gemm(A: T.Tensor((128, 64), T.float16), B: T.Tensor((64, 128), T.float1
         assert gemm.B == "B"
         assert gemm.C == "C"
         assert gemm.trans_A == False
+        assert gemm.trans_B == True
+
+    def test_parse_gemm_with_transpose_aliases(self):
+        """Test parsing GEMM transpose_A/transpose_B keyword aliases."""
+        source = '''
+@T.prim_func
+def test_gemm_alias(A: T.Tensor((128, 64), T.float16), B: T.Tensor((128, 64), T.float16)):
+    with T.Kernel(1, threads=128):
+        C = T.alloc_fragment([128, 128], T.float32)
+        T.gemm(A, B, C, transpose_A=True, transpose_B=True)
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        gemm = None
+        for stmt in kernel.body:
+            if isinstance(stmt, GemmOp):
+                gemm = stmt
+                break
+
+        assert gemm is not None
+        assert gemm.trans_A == True
         assert gemm.trans_B == True
 
     def test_parse_clear(self):

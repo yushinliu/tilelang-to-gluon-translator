@@ -1,5 +1,35 @@
 # TileLang to Gluon 测试计划
 
+## 2026-03-12 Flash/Attention 计划更新
+
+### 已完成
+- 已把真实 upstream `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_mha_fwd_bhsd.py` 接入 `tests/test_accuracy_regression.py` 并转正
+- 已把真实 upstream `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_mha_fwd_bshd.py` 接入 `tests/test_accuracy_regression.py` 并转正
+- 已把真实 upstream `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_gqa_fwd_bshd.py` 接入 `tests/test_accuracy_regression.py` 并转正
+- pointer-mode launcher 维度 constexpr 命名现在会避开 tensor 参数名冲突，例如 tensor `K` 不再和 shape constexpr `K` 冲突
+- raw-AST `T.infinity(...)` 已在 pointer-mode lowering 中映射
+- parser 现在同时支持 `trans_A/trans_B` 和 `transpose_A/transpose_B` 关键字别名
+- `T.region(...)` 现在会按实际变化轴正确线性化到 pointer-mode `load/store` 地址，不再假设最后两轴总是 tile 行列
+- lowered `T.gemm_py(...)` 的 `transpose_B=True` 语义已接通
+- vectorized single-axis elementwise lowering 已补齐 `T.exp2/T.log2/T.Cast`
+- lowered `T.reduce(..., "sum", ...)` 已接通
+
+### 当前阻塞
+1. **线性注意力目录暂时被外部依赖阻塞**
+   - `linear_attention` 当前缺少本地 `fla` / `einops`，不适合优先继续推进
+2. **flash_decoding 需要先筛选更稳定入口**
+   - `example_mha_inference.py` 的小尺寸 probe 在 TileLang 上游 `LayoutInference` 就会失败
+
+### 下一步拆分
+1. **在 attention 族里继续筛下一个可落地入口**
+   - `flash_attention` 目录内优先继续看 `varlen` / 其它 shape 变体
+   - `flash_attention` 之外优先看不依赖 `fla` 的 `flash_decoding` 子入口
+   - 暂时不把 `linear_attention` 作为下一优先项
+2. **把这轮 flash-attention lowering 泛化给更多 attention 变体**
+   - 复用按实际变化轴生成的 `region` 线性化
+   - 复用 lowered `gemm_py transpose_B` 语义
+   - 继续看 `flash_attention` 目录下 `varlen` 的最小真实入口
+
 ## 2026-03-12 SIMT/Hadamard 计划更新
 
 ### 已完成
@@ -17,7 +47,6 @@
 ### 下一步拆分
 1. **继续推进未覆盖 SIMT 类 examples**
    - `gemv` 里的 `splitk_gemv*` / `*_tvm` 变体
-   - `linear_attention`
    - 选择一个不依赖额外上游布局修复的 `flash_decoding` / `attention_sink` 入口先做 probe
 2. **收敛 thread-local lowering 的泛化边界**
    - 当前静态展开只覆盖“边界可静态求值”的 thread-local 小循环

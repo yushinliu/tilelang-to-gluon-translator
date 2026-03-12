@@ -1,14 +1,17 @@
 # TileLang to Gluon 测试实现状态报告
 
-## 2026-03-12 当前状态（`gemv` 新增通过，`cast` 仍是唯一 `xfail`）
+## 2026-03-12 当前状态（`flash_attention` 已覆盖 `bhsd/bshd/gqa` 三类真实 upstream 入口，当前只剩 `cast` 一个 `xfail`）
 
 ### 当前回归
 ```bash
 /home/yuliu/miniconda3/bin/python -m pytest -q tests/test_accuracy_regression.py tests/test_examples_p0.py tests/test_examples_p1.py tests/test_examples_p2.py tests/test_examples_source_p0.py
-# 结果: 60 passed, 1 xfailed
+# 结果: 63 passed, 1 xfailed
 ```
 
 ### 本轮确认
+- `tests/test_accuracy_regression.py::test_instantiated_flash_attention_bhsd_example_jitkernel_matches_tilelang` 已新增并真实通过
+- `tests/test_accuracy_regression.py::test_instantiated_flash_attention_bshd_example_jitkernel_matches_tilelang` 已新增并真实通过
+- `tests/test_accuracy_regression.py::test_instantiated_flash_attention_gqa_bshd_example_jitkernel_matches_tilelang` 已新增并真实通过
 - `tests/test_accuracy_regression.py::test_instantiated_naive_gemv_example_jitkernel_matches_tilelang` 已新增并真实通过
 - `tests/test_accuracy_regression.py::test_instantiated_hadamard_example_jitkernel_matches_tilelang` 已新增并真实通过
 - `tests/test_accuracy_regression.py::test_instantiated_topk_example_jitkernel_matches_tilelang` 已经真实通过，已去掉 `xfail`
@@ -41,11 +44,23 @@
   - 但“计算得到的 float32 SSA 值 -> FP8”在 Gluon 3.6 上会表现出 **toward-zero** 偏差，而不是期望的 RTNE
   - 直接把已加载的 float32 向量 cast 到 FP8 是正确的，因此问题更像是 Gluon 运行时对 computed SSA value 的 FP8 rounding 缺陷，而不是 translator 自己的布局 lowering
 
+### `flash_attention` upstream probe 的本轮修复
+- 已从 `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_mha_fwd_bhsd.py` 接入真实 upstream regression，并在 GPU 上真实通过
+- 已从 `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_mha_fwd_bshd.py` 和 `/mnt/d/yuliu/ws/tilelang/examples/flash_attention/example_gqa_fwd_bshd.py` 接入真实 upstream regression，并在 GPU 上真实通过
+- 本轮为接通这条路径补了几类通用能力：
+  - pointer-mode launcher 维度 constexpr 命名去冲突，避免 tensor `K` 与 shape constexpr `K` 重名
+  - `T.region(...)` 到 pointer address/mask 的多维线性化 lowering 现在会按实际变化轴生成，不再默认最后两轴是 tile 行列
+  - lowered `T.gemm_py(...)` 的 `transpose_B=True` 语义接通
+  - vectorized single-axis elementwise lowering 补齐 `T.exp2/T.log2/T.infinity/T.Cast`
+  - lowered `T.reduce(..., "sum", ...)` 接通
+  - 同一 kernel 内多次 MMA 的 `constexpr` layout 临时名去重
+  - local copy 后的 store 路径不再错误绕回 pre-convert distributed tensor
+
 ### 对发布门槛的影响
 - 当前仍不能准备 `0.0.2`
 - 原因已收敛为两类：
   - `/mnt/d/yuliu/ws/tilelang/examples` 仍未全覆盖
-  - `cast` 真实 example 仍未通过 GPU 精度验证
+  - `cast` 真实 upstream instantiated example 仍未通过 GPU 精度验证
 
 ## 2026-03-10 当前状态（最小 SIMT lowering 已落地）
 

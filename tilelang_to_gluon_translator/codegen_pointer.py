@@ -32,6 +32,7 @@ class GluonPointerCodeGenerator:
         self.block_M = 32
         self.block_N = 32
         self.block_K = 32
+        self.dim_vars = {"M": "M", "N": "N", "K": "K"}
         self.vector_name_counter = 0
         self.has_runtime_dot_operand_layout = self._detect_dot_operand_layout()
         self.has_runtime_mma_v2 = self._detect_mma_v2()
@@ -44,6 +45,7 @@ class GluonPointerCodeGenerator:
         self.vector_name_counter = 0
         self.loop_constant_env = {}
         self.store_passthrough = {}
+        self.dim_vars = self._choose_dim_vars(kernel)
         self.symbol_aliases = self._infer_symbol_aliases()
         self.allocs = {
             alloc.name: alloc for alloc in list(kernel.shared_allocs) + list(getattr(kernel, "register_tensors", []))
@@ -70,12 +72,34 @@ class GluonPointerCodeGenerator:
                 if not isinstance(dim, str):
                     continue
                 if dim == "m":
-                    aliases[dim] = "M"
+                    aliases[dim] = self._dim_var("M")
                 elif dim == "n":
-                    aliases[dim] = "N"
+                    aliases[dim] = self._dim_var("N")
                 elif dim == "k":
-                    aliases[dim] = "K"
+                    aliases[dim] = self._dim_var("K")
         return aliases
+
+    def _choose_dim_vars(self, kernel: GluonKernel) -> dict[str, str]:
+        """Choose launcher dimension names that do not collide with tensor params."""
+        reserved = {
+            p.get("name")
+            for p in getattr(kernel, "params", [])
+            if p.get("type") == "tensor_descriptor" or p.get("annotation", {}).get("type") == "Tensor"
+        }
+        chosen = {}
+        for base in ("M", "N", "K"):
+            candidate = base
+            if candidate in reserved or candidate in chosen.values():
+                candidate = f"{base}_DIM"
+            suffix = 2
+            while candidate in reserved or candidate in chosen.values():
+                candidate = f"{base}_DIM_{suffix}"
+                suffix += 1
+            chosen[base] = candidate
+        return chosen
+
+    def _dim_var(self, base: str) -> str:
+        return self.dim_vars.get(base, base)
 
     def _generate_imports(self):
         """Generate import statements."""
@@ -112,9 +136,9 @@ class GluonPointerCodeGenerator:
 
         # Add dimension parameters as constexpr (passed from launcher)
         constexpr_params = [
-            f"M: gl.constexpr",
-            f"N: gl.constexpr",
-            f"K: gl.constexpr",
+            f"{self._dim_var('M')}: gl.constexpr",
+            f"{self._dim_var('N')}: gl.constexpr",
+            f"{self._dim_var('K')}: gl.constexpr",
             f"num_warps: gl.constexpr = {kernel.num_warps}",
             f"BLOCK_M: gl.constexpr = {self.block_M}",
             f"BLOCK_N: gl.constexpr = {self.block_N}",
@@ -245,53 +269,109 @@ class GluonPointerCodeGenerator:
 
             self.lines.append(f"{self._indent()}# Load A and B blocks for current k")
             self.lines.append(f"{self._indent()}offs_k = gl.arange(0, BLOCK_K)")
-            self.lines.append(f"{self._indent()}a_ptrs = {A_name} + (offs_m[:, None] * K + (k + offs_k[None, :]))")
-            self.lines.append(f"{self._indent()}a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)")
+            self.lines.append(
+                f"{self._indent()}a_ptrs = {A_name} + "
+                f"(offs_m[:, None] * {self._dim_var('K')} + (k + offs_k[None, :]))"
+            )
+            self.lines.append(
+                f"{self._indent()}a_mask = (offs_m[:, None] < {self._dim_var('M')}) & "
+                f"((k + offs_k[None, :]) < {self._dim_var('K')})"
+            )
             self.lines.append(f"{self._indent()}a = gl.load(a_ptrs, mask=a_mask)")
 
-            self.lines.append(f"{self._indent()}b_ptrs = {B_name} + ((k + offs_k[:, None]) * N + offs_n[None, :]))")
-            self.lines.append(f"{self._indent()}b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)")
+            self.lines.append(
+                f"{self._indent()}b_ptrs = {B_name} + "
+                f"((k + offs_k[:, None]) * {self._dim_var('N')} + offs_n[None, :]))"
+            )
+            self.lines.append(
+                f"{self._indent()}b_mask = ((k + offs_k[:, None]) < {self._dim_var('K')}) & "
+                f"(offs_n[None, :] < {self._dim_var('N')})"
+            )
             self.lines.append(f"{self._indent()}b = gl.load(b_ptrs, mask=b_mask)")
 
             A_var = "a"
             B_var = "b"
 
         self.lines.append(f"{self._indent()}# MMA: {stmt.acc} = dot({A_var}, {B_var}, acc={stmt.acc})")
-        self.lines.append(f"{self._indent()}acc_layout: gl.constexpr = {stmt.acc}.type.layout")
+        layout_id = self.vector_name_counter
+        self.vector_name_counter += 1
+        acc_layout_name = f"acc_layout_{layout_id}"
+        a_layout_name = f"a_layout_{layout_id}"
+        b_layout_name = f"b_layout_{layout_id}"
+        self.lines.append(f"{self._indent()}{acc_layout_name}: gl.constexpr = {stmt.acc}.type.layout")
         layout_ctor = "gl.DotOperandLayout" if self.has_runtime_dot_operand_layout else "DotOperandLayout"
         k_width = self._dot_k_width_literal(A_var, B_var)
         self.lines.append(
-            f"{self._indent()}a_layout: gl.constexpr = {layout_ctor}("
-            f"parent=acc_layout, operand_index=0, k_width={k_width})"
+            f"{self._indent()}{a_layout_name}: gl.constexpr = {layout_ctor}("
+            f"parent={acc_layout_name}, operand_index=0, k_width={k_width})"
         )
         self.lines.append(
-            f"{self._indent()}b_layout: gl.constexpr = {layout_ctor}("
-            f"parent=acc_layout, operand_index=1, k_width={k_width})"
+            f"{self._indent()}{b_layout_name}: gl.constexpr = {layout_ctor}("
+            f"parent={acc_layout_name}, operand_index=1, k_width={k_width})"
         )
-        self.lines.append(f"{self._indent()}{A_var}_dot = gl.convert_layout({A_var}, a_layout)")
-        self.lines.append(f"{self._indent()}{B_var}_dot = gl.convert_layout({B_var}, b_layout)")
+        self.lines.append(f"{self._indent()}{A_var}_dot = gl.convert_layout({A_var}, {a_layout_name})")
+        self.lines.append(f"{self._indent()}{B_var}_dot = gl.convert_layout({B_var}, {b_layout_name})")
         if self.has_runtime_mma_v2:
             self.lines.append(f"{self._indent()}{stmt.acc} = mma_v2({A_var}_dot, {B_var}_dot, {stmt.acc})")
         else:
             self.lines.append(f"{self._indent()}{stmt.acc}_dot = tl.dot({A_var}_dot, {B_var}_dot, acc={stmt.acc})")
-            self.lines.append(f"{self._indent()}{stmt.acc} = gl.convert_layout({stmt.acc}_dot, acc_layout)")
+            self.lines.append(f"{self._indent()}{stmt.acc} = gl.convert_layout({stmt.acc}_dot, {acc_layout_name})")
 
-    def _mma_lines(self, a_var: str, b_var: str, acc_var: str) -> list[str]:
+    def _tensor_shape(self, tensor_name: str) -> list[str]:
+        """Return known tensor/alloc shape expressions."""
+        alloc = self.allocs.get(tensor_name)
+        if alloc is not None and getattr(alloc, "shape", None):
+            return [self._fix_expr(dim) for dim in getattr(alloc, "shape", [])]
+        return self._shape_exprs(tensor_name)
+
+    def _mma_lines(
+        self,
+        a_var: str,
+        b_var: str,
+        acc_var: str,
+        *,
+        trans_a: bool = False,
+        trans_b: bool = False,
+        m_dim: Optional[str] = None,
+        n_dim: Optional[str] = None,
+        k_dim: Optional[str] = None,
+    ) -> list[str]:
         """Emit pointer-mode MMA lines for lowered TIR helper calls."""
         layout_ctor = "gl.DotOperandLayout" if self.has_runtime_dot_operand_layout else "DotOperandLayout"
         k_width = self._dot_k_width_literal(a_var, b_var)
+        layout_id = self.vector_name_counter
+        self.vector_name_counter += 1
+        acc_layout_name = f"acc_layout_{layout_id}"
+        a_layout_name = f"a_layout_{layout_id}"
+        b_layout_name = f"b_layout_{layout_id}"
+        a_input = a_var
+        b_input = b_var
+        a_shape = self._tensor_shape(a_var)
+        b_shape = self._tensor_shape(b_var)
+        if trans_a and len(a_shape) >= 2 and m_dim is not None and k_dim is not None:
+            if a_shape[-2] == k_dim and a_shape[-1] == m_dim:
+                a_input = f"{a_var}_trans"
+        if trans_b and len(b_shape) >= 2 and n_dim is not None and k_dim is not None:
+            if b_shape[-2] == n_dim and b_shape[-1] == k_dim:
+                b_input = f"{b_var}_trans"
         lines = [
-            f"acc_layout: gl.constexpr = {acc_var}.type.layout",
-            f"a_layout: gl.constexpr = {layout_ctor}(parent=acc_layout, operand_index=0, k_width={k_width})",
-            f"b_layout: gl.constexpr = {layout_ctor}(parent=acc_layout, operand_index=1, k_width={k_width})",
-            f"{a_var}_dot = gl.convert_layout({a_var}, a_layout)",
-            f"{b_var}_dot = gl.convert_layout({b_var}, b_layout)",
+            f"{acc_layout_name}: gl.constexpr = {acc_var}.type.layout",
+            f"{a_layout_name}: gl.constexpr = {layout_ctor}(parent={acc_layout_name}, operand_index=0, k_width={k_width})",
+            f"{b_layout_name}: gl.constexpr = {layout_ctor}(parent={acc_layout_name}, operand_index=1, k_width={k_width})",
         ]
+        if a_input != a_var:
+            lines.append(f"{a_input} = gl.permute({a_var}, [1, 0])")
+        if b_input != b_var:
+            lines.append(f"{b_input} = gl.permute({b_var}, [1, 0])")
+        lines.extend([
+            f"{a_var}_dot = gl.convert_layout({a_input}, {a_layout_name})",
+            f"{b_var}_dot = gl.convert_layout({b_input}, {b_layout_name})",
+        ])
         if self.has_runtime_mma_v2:
             lines.append(f"{acc_var} = mma_v2({a_var}_dot, {b_var}_dot, {acc_var})")
         else:
             lines.append(f"{acc_var}_dot = tl.dot({a_var}_dot, {b_var}_dot, acc={acc_var})")
-            lines.append(f"{acc_var} = gl.convert_layout({acc_var}_dot, acc_layout)")
+            lines.append(f"{acc_var} = gl.convert_layout({acc_var}_dot, {acc_layout_name})")
         return lines
 
     def _fix_expr(self, expr):
@@ -331,22 +411,43 @@ class GluonPointerCodeGenerator:
             if len(shape) >= 2 and len(src_idx) >= 2:
                 rows = self._fix_expr(shape[0])
                 cols = self._fix_expr(shape[1])
-                row_base = src_idx[0]
-                col_base = src_idx[1]
-                stride = self._row_stride_expr(stmt.src_tensor)
+                region_extents = [self._fix_expr(e) for e in (stmt.src_extents or [])]
+                row_axis, col_axis = self._region_matrix_axes(stmt.src_tensor, src_idx, region_extents)
+                base_offset = self._region_base_offset_expr(stmt.src_tensor, src_idx, region_extents)
+                row_stride = self._stride_expr(stmt.src_tensor, row_axis)
+                col_stride = self._stride_expr(stmt.src_tensor, col_axis)
                 layout = self._blocked_layout_expr(rows, cols)
                 self.lines.append(
-                    f"{self._indent()}rows_{stmt.smem} = {row_base} + gl.arange(0, {rows}, layout=gl.SliceLayout(1, {layout}))"
+                    f"{self._indent()}rows_{stmt.smem} = gl.arange(0, {rows}, layout=gl.SliceLayout(1, {layout}))"
                 )
                 self.lines.append(
-                    f"{self._indent()}cols_{stmt.smem} = {col_base} + gl.arange(0, {cols}, layout=gl.SliceLayout(0, {layout}))"
+                    f"{self._indent()}cols_{stmt.smem} = gl.arange(0, {cols}, layout=gl.SliceLayout(0, {layout}))"
+                )
+                base_expr = f"{stmt.src_tensor} + {base_offset}" if base_offset != "0" else stmt.src_tensor
+                row_term = (
+                    f"rows_{stmt.smem}[:, None]"
+                    if row_stride == "1"
+                    else f"rows_{stmt.smem}[:, None] * {row_stride}"
+                )
+                col_term = (
+                    f"cols_{stmt.smem}[None, :]"
+                    if col_stride == "1"
+                    else f"cols_{stmt.smem}[None, :] * {col_stride}"
                 )
                 self.lines.append(
-                    f"{self._indent()}ptr_{stmt.smem} = {stmt.src_tensor} + rows_{stmt.smem}[:, None] * {stride} + cols_{stmt.smem}[None, :]"
+                    f"{self._indent()}ptr_{stmt.smem} = {base_expr} + {row_term} + {col_term}"
+                )
+                mask_terms = self._region_mask_terms(
+                    stmt.src_tensor,
+                    src_idx,
+                    region_extents,
+                    row_axis,
+                    col_axis,
+                    f"rows_{stmt.smem}[:, None]",
+                    f"cols_{stmt.smem}[None, :]",
                 )
                 self.lines.append(
-                    f"{self._indent()}mask_{stmt.smem} = (rows_{stmt.smem}[:, None] < {self._dim_expr(stmt.src_tensor, 0)}) & "
-                    f"(cols_{stmt.smem}[None, :] < {self._dim_expr(stmt.src_tensor, 1)})"
+                    f"{self._indent()}mask_{stmt.smem} = " + " & ".join(mask_terms)
                 )
                 self.lines.append(
                     f"{self._indent()}{stmt.smem} = gl.load(ptr_{stmt.smem}, mask=mask_{stmt.smem})"
@@ -376,23 +477,39 @@ class GluonPointerCodeGenerator:
             if len(dst_idx) >= 2 and len(shape) >= 2:
                 rows = shape[0]
                 cols = shape[1]
+                region_extents = [self._fix_expr(e) for e in (stmt.dst_extents or [])]
+                row_axis, col_axis = self._region_matrix_axes(stmt.dst_tensor, dst_idx, region_extents)
+                base_offset = self._region_base_offset_expr(stmt.dst_tensor, dst_idx, region_extents)
+                row_stride = self._stride_expr(stmt.dst_tensor, row_axis)
+                col_stride = self._stride_expr(stmt.dst_tensor, col_axis)
                 layout = self._tensor_layout_expr(stmt.smem)
                 self.lines.append(
-                    f"{self._indent()}rows_out = ({dst_idx[0]}) + gl.arange(0, {rows}, layout=gl.SliceLayout(1, {layout}))"
+                    f"{self._indent()}rows_out = gl.arange(0, {rows}, layout=gl.SliceLayout(1, {layout}))"
                 )
                 self.lines.append(
-                    f"{self._indent()}cols_out = ({dst_idx[1]}) + gl.arange(0, {cols}, layout=gl.SliceLayout(0, {layout}))"
+                    f"{self._indent()}cols_out = gl.arange(0, {cols}, layout=gl.SliceLayout(0, {layout}))"
                 )
-                self.lines.append(
-                    f"{self._indent()}ptr_out = {stmt.dst_tensor} + (rows_out[:, None] * N + cols_out[None, :])"
+                base_expr = f"{stmt.dst_tensor} + {base_offset}" if base_offset != "0" else stmt.dst_tensor
+                row_term = "rows_out[:, None]" if row_stride == "1" else f"rows_out[:, None] * {row_stride}"
+                col_term = "cols_out[None, :]" if col_stride == "1" else f"cols_out[None, :] * {col_stride}"
+                self.lines.append(f"{self._indent()}ptr_out = {base_expr} + {row_term} + {col_term}")
+                mask_terms = self._region_mask_terms(
+                    stmt.dst_tensor,
+                    dst_idx,
+                    region_extents,
+                    row_axis,
+                    col_axis,
+                    "rows_out[:, None]",
+                    "cols_out[None, :]",
                 )
-                self.lines.append(
-                    f"{self._indent()}mask_out = (rows_out[:, None] < M) & (cols_out[None, :] < N)"
-                )
+                self.lines.append(f"{self._indent()}mask_out = " + " & ".join(mask_terms))
                 self.lines.append(f"{self._indent()}gl.store(ptr_out, {store_value}, mask=mask_out)")
             else:
                 if len(dst_idx) >= 2:
-                    self.lines.append(f"{self._indent()}ptr_out = {stmt.dst_tensor} + ({dst_idx[0]}) * N + ({dst_idx[1]})")
+                    self.lines.append(
+                        f"{self._indent()}ptr_out = {stmt.dst_tensor} + "
+                        f"({dst_idx[0]}) * {self._dim_var('N')} + ({dst_idx[1]})"
+                    )
                 else:
                     self.lines.append(f"{self._indent()}ptr_out = {stmt.dst_tensor} + {dst_idx[0] if dst_idx else '0'}")
                 self.lines.append(f"{self._indent()}gl.store(ptr_out, {store_value})")
@@ -401,8 +518,14 @@ class GluonPointerCodeGenerator:
             tensor_params = [p['name'] for p in self.kernel.params]
             C_name = tensor_params[-1] if tensor_params else "C"
             self.lines.append(f"{self._indent()}# Store result to global memory")
-            self.lines.append(f"{self._indent()}c_ptrs = {C_name} + (offs_m[:, None] * N + offs_n[None, :])")
-            self.lines.append(f"{self._indent()}c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)")
+            self.lines.append(
+                f"{self._indent()}c_ptrs = {C_name} + "
+                f"(offs_m[:, None] * {self._dim_var('N')} + offs_n[None, :])"
+            )
+            self.lines.append(
+                f"{self._indent()}c_mask = (offs_m[:, None] < {self._dim_var('M')}) & "
+                f"(offs_n[None, :] < {self._dim_var('N')})"
+            )
             self.lines.append(f"{self._indent()}gl.store(c_ptrs, {stmt.smem}, mask=c_mask)")
 
     def _generate_loop(self, stmt: GluonLoop):
@@ -495,12 +618,6 @@ class GluonPointerCodeGenerator:
         src_dtype = self._tensor_dtype(stmt.src)
         dst_dtype = self._tensor_dtype(stmt.dst)
         if src_dtype is not None and dst_dtype is not None and src_dtype != dst_dtype:
-            if (
-                self._is_floating_dtype(src_dtype)
-                and self._is_floating_dtype(dst_dtype)
-                and self._dtype_bitwidth(dst_dtype) < self._dtype_bitwidth(src_dtype)
-            ):
-                self.store_passthrough[stmt.dst] = stmt.src
             src_expr = self._cast_expr(src_expr, src_dtype, dst_dtype)
         if dst_layout != f"{stmt.dst}.type.layout" and dst_layout != src_layout:
             self.lines.append(f"{self._indent()}{stmt.dst} = gl.convert_layout({src_expr}, {dst_layout})")
@@ -633,25 +750,30 @@ class GluonPointerCodeGenerator:
 
         if tensor_params:
             first = tensor_params[0]['name']
-            self.lines.append(f"{self._indent()}M = {first}.shape[0]")
+            self.lines.append(f"{self._indent()}{self._dim_var('M')} = {first}.shape[0]")
             if len(tensor_params) >= 2:
                 second = tensor_params[1]['name']
-                self.lines.append(f"{self._indent()}K = {second}.shape[0]")
-                self.lines.append(f"{self._indent()}N = {second}.shape[1]")
+                self.lines.append(f"{self._indent()}{self._dim_var('K')} = {second}.shape[0]")
+                self.lines.append(f"{self._indent()}{self._dim_var('N')} = {second}.shape[1]")
             else:
-                self.lines.append(f"{self._indent()}N = {first}.shape[1]")
-                self.lines.append(f"{self._indent()}K = {first}.shape[1]")
+                self.lines.append(f"{self._indent()}{self._dim_var('N')} = {first}.shape[1]")
+                self.lines.append(f"{self._indent()}{self._dim_var('K')} = {first}.shape[1]")
             if kernel.grid:
                 if len(kernel.grid) == 1:
                     self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)},)")
                 else:
                     self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)})")
             else:
-                self.lines.append(f"{self._indent()}grid = (_ceildiv(N, BLOCK_N), _ceildiv(M, BLOCK_M))")
+                self.lines.append(
+                    f"{self._indent()}grid = (_ceildiv({self._dim_var('N')}, BLOCK_N), "
+                    f"_ceildiv({self._dim_var('M')}, BLOCK_M))"
+                )
 
             # Launch kernel with dimensions as constexpr
             ptr_args = ", ".join([p['name'] for p in tensor_params])
-            dim_args = "M=M, N=N, K=K"
+            dim_args = ", ".join(
+                f"{self._dim_var(base)}={self._dim_var(base)}" for base in ("M", "N", "K")
+            )
             all_args = ", ".join([ptr_args, dim_args])
             self.lines.append(f"{self._indent()}{kernel.name}_kernel[grid]({all_args})")
             param_names = {p['name'] for p in tensor_params}
@@ -703,11 +825,38 @@ class GluonPointerCodeGenerator:
                 continue
             shape = param.get("shape", []) or []
             if len(shape) >= 2:
-                return self._fix_expr(str(shape[1]))
+                return self._stride_expr(tensor_name, len(shape) - 2)
         tensor_names = [p["name"] for p in self.kernel.params if p.get("type") == "tensor_descriptor"]
         if tensor_names and tensor_name == tensor_names[0]:
-            return "K"
-        return "N"
+            return self._dim_var("K")
+        return self._dim_var("N")
+
+    def _shape_exprs(self, tensor_name: str) -> list[str]:
+        """Return symbolic shape expressions for a known tensor parameter."""
+        for param in self.kernel.params:
+            if param.get("name") != tensor_name:
+                continue
+            return [self._fix_expr(str(dim)) for dim in (param.get("shape", []) or [])]
+        return []
+
+    def _stride_expr(self, tensor_name: str, axis: int) -> str:
+        """Return contiguous row-major stride for a tensor axis."""
+        shape = self._shape_exprs(tensor_name)
+        if not shape:
+            rank = self._tensor_rank(tensor_name)
+            if rank == 0:
+                return "1"
+            if rank <= 2:
+                return self._dim_var("K") if axis == 0 else "1"
+            return "1"
+        if axis >= len(shape) - 1:
+            return "1"
+        stride_terms = shape[axis + 1 :]
+        if not stride_terms:
+            return "1"
+        if len(stride_terms) == 1:
+            return stride_terms[0]
+        return "(" + " * ".join(stride_terms) + ")"
 
     def _dim_expr(self, tensor_name: str, axis: int) -> str:
         """Return symbolic extents for known matrix operands."""
@@ -719,10 +868,67 @@ class GluonPointerCodeGenerator:
                 return self._fix_expr(str(shape[axis]))
         tensor_names = [p["name"] for p in self.kernel.params if p.get("type") == "tensor_descriptor"]
         if tensor_name == tensor_names[0]:
-            return "M" if axis == 0 else "K"
+            return self._dim_var("M") if axis == 0 else self._dim_var("K")
         if tensor_name == tensor_names[-1]:
-            return "M" if axis == 0 else "N"
-        return "K" if axis == 0 else "N"
+            return self._dim_var("M") if axis == 0 else self._dim_var("N")
+        return self._dim_var("K") if axis == 0 else self._dim_var("N")
+
+    def _linear_offset_expr(self, tensor_name: str, indices: list[str]) -> str:
+        """Flatten row-major tensor indices into a linear pointer offset."""
+        if not indices:
+            return "0"
+        terms = []
+        for axis, idx in enumerate(indices):
+            stride = self._stride_expr(tensor_name, axis)
+            if stride == "1":
+                terms.append(f"({idx})")
+            else:
+                terms.append(f"({idx}) * {stride}")
+        return " + ".join(terms) if terms else "0"
+
+    def _region_matrix_axes(self, tensor_name: str, indices: list[str], extents: list[str]) -> tuple[int, int]:
+        """Infer which tensor axes form the row/col tile in a T.region copy."""
+        if len(extents) == len(indices):
+            varying_axes = [axis for axis, extent in enumerate(extents) if str(extent) != "1"]
+            if len(varying_axes) >= 2:
+                return varying_axes[0], varying_axes[1]
+        tensor_rank = self._tensor_rank(tensor_name)
+        return max(tensor_rank - 2, 0), max(tensor_rank - 1, 0)
+
+    def _region_base_offset_expr(self, tensor_name: str, indices: list[str], extents: list[str]) -> str:
+        """Compute the linearized base offset for a T.region copy."""
+        terms = []
+        for axis, idx in enumerate(indices):
+            base_idx = idx
+            stride = self._stride_expr(tensor_name, axis)
+            if base_idx == "0":
+                continue
+            if stride == "1":
+                terms.append(f"({base_idx})")
+            else:
+                terms.append(f"({base_idx}) * {stride}")
+        return " + ".join(terms) if terms else "0"
+
+    def _region_mask_terms(
+        self,
+        tensor_name: str,
+        indices: list[str],
+        extents: list[str],
+        row_axis: int,
+        col_axis: int,
+        row_expr: str,
+        col_expr: str,
+    ) -> list[str]:
+        """Build bounds checks for a T.region copy."""
+        mask_terms = []
+        for axis, idx in enumerate(indices):
+            if axis == row_axis:
+                mask_terms.append(f"(({idx}) + {row_expr} < {self._dim_expr(tensor_name, axis)})")
+            elif axis == col_axis:
+                mask_terms.append(f"(({idx}) + {col_expr} < {self._dim_expr(tensor_name, axis)})")
+            elif len(extents) != len(indices) or str(extents[axis]) == "1":
+                mask_terms.append(f"(({idx}) < {self._dim_expr(tensor_name, axis)})")
+        return mask_terms or ["True"]
 
     def _dot_k_width_literal(self, a_var: str, b_var: str) -> int:
         """Infer a constexpr k-width literal for DotOperandLayout."""
@@ -1073,6 +1279,12 @@ class GluonPointerCodeGenerator:
                         true_val = self._lower_ast_expr(node.args[1])
                         false_val = self._lower_ast_expr(node.args[2])
                         return f"tl.where({cond}, {true_val}, {false_val})"
+                    if node.func.attr == "infinity":
+                        return "float('inf')"
+                    if node.func.attr == "exp2":
+                        return f"tl.exp2({self._lower_ast_expr(node.args[0])})"
+                    if node.func.attr == "log2":
+                        return f"tl.log2({self._lower_ast_expr(node.args[0])})"
                     if node.func.attr == "max":
                         return f"tl.maximum({self._lower_ast_expr(node.args[0])}, {self._lower_ast_expr(node.args[1])})"
                     if node.func.attr == "min":
@@ -1293,6 +1505,8 @@ class GluonPointerCodeGenerator:
             dst_layout = self._tensor_layout_expr(dst)
             if op_kind == "max":
                 return [f"{dst} = gl.convert_layout(tl.max({src}, axis={axis_expr}), {dst_layout})"]
+            if op_kind == "sum":
+                return [f"{dst} = gl.convert_layout(tl.sum({src}, axis={axis_expr}), {dst_layout})"]
             if op_kind == "absmax":
                 return [f"{dst} = gl.convert_layout(tl.max(tl.abs({src}), axis={axis_expr}), {dst_layout})"]
 
@@ -1302,7 +1516,33 @@ class GluonPointerCodeGenerator:
             acc_var = self._region_base_name(call.args[2])
             if a_var is None or b_var is None or acc_var is None:
                 return None
-            return self._mma_lines(a_var, b_var, acc_var)
+            trans_a = False
+            trans_b = False
+            m_dim = None
+            n_dim = None
+            k_dim = None
+            if call.func.attr == "gemm_py" and len(call.args) >= 8:
+                trans_a = bool(self._eval_static_int_ast(call.args[3]))
+                trans_b = bool(self._eval_static_int_ast(call.args[4]))
+                m_val = self._eval_static_int_ast(call.args[5])
+                n_val = self._eval_static_int_ast(call.args[6])
+                k_val = self._eval_static_int_ast(call.args[7])
+                if m_val is not None:
+                    m_dim = str(m_val)
+                if n_val is not None:
+                    n_dim = str(n_val)
+                if k_val is not None:
+                    k_dim = str(k_val)
+            return self._mma_lines(
+                a_var,
+                b_var,
+                acc_var,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                m_dim=m_dim,
+                n_dim=n_dim,
+                k_dim=k_dim,
+            )
         return None
 
     def _warp_shuffle_expr(self, value_expr: str, lane_expr: str) -> str:
@@ -1526,6 +1766,20 @@ class GluonPointerCodeGenerator:
                         true_val = self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)
                         false_val = self._lower_vectorized_expr(node.args[2], axis_info, target_shape, target_layout)
                         return f"tl.where({cond}, {true_val}, {false_val})"
+                    if node.func.attr == "Cast":
+                        dtype_arg = node.args[0]
+                        if isinstance(dtype_arg, ast.Constant):
+                            dtype_expr = self._dtype_attr_expr(str(dtype_arg.value))
+                        else:
+                            dtype_expr = self._lower_vectorized_expr(dtype_arg, axis_info, target_shape, target_layout)
+                        value_expr = self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)
+                        return f"tl.cast({value_expr}, {dtype_expr})"
+                    if node.func.attr == "infinity":
+                        return "float('inf')"
+                    if node.func.attr == "exp2":
+                        return f"tl.exp2({self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)})"
+                    if node.func.attr == "log2":
+                        return f"tl.log2({self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)})"
                     if node.func.attr == "max":
                         return f"tl.maximum({self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)}, {self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)})"
                     if node.func.attr == "min":

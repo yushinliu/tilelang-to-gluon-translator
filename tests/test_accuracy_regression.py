@@ -296,6 +296,54 @@ class TestExamplesStrictCompatibility:
         assert gluon_kernel.translator.use_pointer_mode is True
 
     @pytest.mark.gpu
+    def test_instantiated_flash_attention_bhsd_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_flash_attention_bhsd", "flash_attention/example_mha_fwd_bhsd.py")
+
+        tilelang_kernel = module.flashattn(1, 1, 64, 64, 32, False, 64, 64, 1, 128)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        q = torch.randn(1, 1, 64, 32, device=device, dtype=torch.float16)
+        k = torch.randn(1, 1, 64, 32, device=device, dtype=torch.float16)
+        v = torch.randn(1, 1, 64, 32, device=device, dtype=torch.float16)
+        tl_out = tilelang_kernel(q, k, v)
+        gl_out = gluon_kernel(q, k, v)
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_flash_attention_bshd_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_flash_attention_bshd", "flash_attention/example_mha_fwd_bshd.py")
+
+        tilelang_kernel = module.flashattn(1, 1, 64, 32, False, 64, 64, 1, 128)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        q = torch.randn(1, 64, 1, 32, device=device, dtype=torch.float16)
+        k = torch.randn(1, 64, 1, 32, device=device, dtype=torch.float16)
+        v = torch.randn(1, 64, 1, 32, device=device, dtype=torch.float16)
+        tl_out = tilelang_kernel(q, k, v)
+        gl_out = gluon_kernel(q, k, v)
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_flash_attention_gqa_bshd_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_flash_attention_gqa_bshd", "flash_attention/example_gqa_fwd_bshd.py")
+
+        tilelang_kernel = module.flashattn(1, 4, 64, 32, False, 2, 64, 64, 2, 128)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        q = torch.randn(1, 64, 4, 32, device=device, dtype=torch.float16)
+        k = torch.randn(1, 64, 2, 32, device=device, dtype=torch.float16)
+        v = torch.randn(1, 64, 2, 32, device=device, dtype=torch.float16)
+        tl_out = tilelang_kernel(q, k, v)
+        gl_out = gluon_kernel(q, k, v)
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
     def test_instantiated_naive_gemv_example_jitkernel_matches_tilelang(self, device):
         module = _load_example_module("tl_example_gemv", "gemv/example_gemv.py")
 
