@@ -294,3 +294,18 @@ class TestExamplesStrictCompatibility:
 
         assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
         assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_naive_gemv_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_gemv", "gemv/example_gemv.py")
+
+        tilelang_kernel = module.naive_gemv(128, 128, 128, 128)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        a = torch.randn(128, device=device, dtype=torch.float16)
+        b = torch.randn(128, 128, device=device, dtype=torch.float16)
+        tl_out = tilelang_kernel(a, b)
+        gl_out = gluon_kernel(a, b)
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True

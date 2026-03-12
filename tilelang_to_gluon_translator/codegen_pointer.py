@@ -897,6 +897,50 @@ class GluonPointerCodeGenerator:
     def _thread_local_elem_name(self, name: str, idx: int) -> str:
         return f"{name}_{idx}"
 
+    def _thread_column_elem_name(self, name: str, idx: int) -> str:
+        return f"{name}_{idx}"
+
+    def _uses_thread_var(self, node: ast.AST) -> bool:
+        thread_vars = {name for name in getattr(self.kernel, "thread_var_names", []) if name}
+        return any(isinstance(child, ast.Name) and child.id in thread_vars for child in ast.walk(node))
+
+    def _resolve_temp_indexed_name(self, node: ast.Subscript) -> Optional[str]:
+        if not isinstance(node.value, ast.Name) or self._is_global_tensor(node.value.id):
+            return None
+        if self._is_scalar_like_local(node.value.id) or self._is_thread_local_tensor(node.value.id):
+            return None
+        indices = self._subscript_indices(node)
+        if len(indices) == 1:
+            idx_value = self._eval_static_int_ast(indices[0])
+            if idx_value is not None:
+                return self._thread_local_elem_name(node.value.id, idx_value)
+            return None
+        if len(indices) == 2 and self._uses_thread_var(indices[0]):
+            idx_value = self._eval_static_int_ast(indices[1])
+            if idx_value is not None:
+                return self._thread_column_elem_name(node.value.id, idx_value)
+        return None
+
+    def _lower_global_access_mask(self, tensor_name: str, indices: list[ast.AST]) -> Optional[str]:
+        if not any(self._uses_thread_var(idx) for idx in indices):
+            return None
+        lowered = [self._lower_ast_expr(idx) for idx in indices]
+        rank = self._tensor_rank(tensor_name)
+        if rank <= 1 or len(lowered) == 1:
+            return f"({lowered[0]}) < {self._dim_expr(tensor_name, 0)}"
+        if len(lowered) == 2:
+            return (
+                f"(({lowered[0]}) < {self._dim_expr(tensor_name, 0)}) & "
+                f"(({lowered[1]}) < {self._dim_expr(tensor_name, 1)})"
+            )
+        if len(lowered) == 3:
+            return (
+                f"(({lowered[0]}) < {self._dim_expr(tensor_name, 0)}) & "
+                f"(({lowered[1]}) < {self._dim_expr(tensor_name, 1)}) & "
+                f"(({lowered[2]}) < {self._dim_expr(tensor_name, 2)})"
+            )
+        return None
+
     def _operator_str(self, op: ast.AST) -> str:
         mapping = {
             ast.Add: "+",
@@ -999,6 +1043,14 @@ class GluonPointerCodeGenerator:
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
                 if isinstance(node.func.value, ast.Name) and node.func.value.id == "T":
+                    if node.func.attr == "Cast":
+                        dtype_arg = node.args[0]
+                        if isinstance(dtype_arg, ast.Constant):
+                            dtype_expr = self._dtype_attr_expr(str(dtype_arg.value))
+                        else:
+                            dtype_expr = self._lower_ast_expr(dtype_arg)
+                        value_expr = self._lower_ast_expr(node.args[1])
+                        return f"tl.cast({value_expr}, {dtype_expr})"
                     if node.func.attr == "get_thread_binding":
                         dim = int(node.args[0].value) if node.args else 0
                         return self._thread_binding_expr(dim)
@@ -1047,6 +1099,9 @@ class GluonPointerCodeGenerator:
             if hasattr(ast, "unparse"):
                 return ast.unparse(node).strip()
         if isinstance(node, ast.Subscript):
+            temp_name = self._resolve_temp_indexed_name(node)
+            if temp_name is not None:
+                return temp_name
             if isinstance(node.value, ast.Name) and self._is_thread_local_tensor(node.value.id):
                 indices = self._subscript_indices(node)
                 if len(indices) == 1:
@@ -1056,6 +1111,9 @@ class GluonPointerCodeGenerator:
                     return self._thread_local_elem_name(node.value.id, idx_value)
             if isinstance(node.value, ast.Name) and self._is_global_tensor(node.value.id):
                 ptr_expr = self._lower_global_ptr_expr(node.value.id, self._subscript_indices(node))
+                mask_expr = self._lower_global_access_mask(node.value.id, self._subscript_indices(node))
+                if mask_expr is not None:
+                    return f"gl.load({ptr_expr}, mask={mask_expr})"
                 return f"gl.load({ptr_expr})"
             if isinstance(node.value, ast.Name) and self._is_scalar_like_local(node.value.id):
                 indices = self._subscript_indices(node)
@@ -1069,6 +1127,9 @@ class GluonPointerCodeGenerator:
         raise NotImplementedError(f"Unsupported AST expression: {ast.dump(node)}")
 
     def _lower_ast_store(self, target: ast.Subscript, value_expr: str) -> str:
+        temp_name = self._resolve_temp_indexed_name(target)
+        if temp_name is not None:
+            return f"{temp_name} = {value_expr}"
         if isinstance(target.value, ast.Name) and self._is_thread_local_tensor(target.value.id):
             indices = self._subscript_indices(target)
             if len(indices) == 1:
@@ -1078,6 +1139,9 @@ class GluonPointerCodeGenerator:
                 return f"{self._thread_local_elem_name(target.value.id, idx_value)} = {value_expr}"
         if isinstance(target.value, ast.Name) and self._is_global_tensor(target.value.id):
             ptr_expr = self._lower_global_ptr_expr(target.value.id, self._subscript_indices(target))
+            mask_expr = self._lower_global_access_mask(target.value.id, self._subscript_indices(target))
+            if mask_expr is not None:
+                return f"gl.store({ptr_expr}, {value_expr}, mask={mask_expr})"
             return f"gl.store({ptr_expr}, {value_expr})"
         if isinstance(target.value, ast.Name) and self._is_scalar_like_local(target.value.id):
             indices = self._subscript_indices(target)

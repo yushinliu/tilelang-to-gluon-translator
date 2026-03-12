@@ -1,14 +1,15 @@
 # TileLang to Gluon 测试实现状态报告
 
-## 2026-03-12 当前状态（`hadamard_transform` 新增通过，`cast` 仍是唯一 `xfail`）
+## 2026-03-12 当前状态（`gemv` 新增通过，`cast` 仍是唯一 `xfail`）
 
 ### 当前回归
 ```bash
 /home/yuliu/miniconda3/bin/python -m pytest -q tests/test_accuracy_regression.py tests/test_examples_p0.py tests/test_examples_p1.py tests/test_examples_p2.py tests/test_examples_source_p0.py
-# 结果: 59 passed, 1 xfailed
+# 结果: 60 passed, 1 xfailed
 ```
 
 ### 本轮确认
+- `tests/test_accuracy_regression.py::test_instantiated_naive_gemv_example_jitkernel_matches_tilelang` 已新增并真实通过
 - `tests/test_accuracy_regression.py::test_instantiated_hadamard_example_jitkernel_matches_tilelang` 已新增并真实通过
 - `tests/test_accuracy_regression.py::test_instantiated_topk_example_jitkernel_matches_tilelang` 已经真实通过，已去掉 `xfail`
 - `tests/test_accuracy_regression.py::test_instantiated_dynamic_shape_matmul_matches_tilelang` 已新增并通过
@@ -18,9 +19,19 @@
 - lowered TIR `threadIdx` + `T.tvm_warp_shuffle(...)` 已接通一条最小可用的 SIMT 路径
 - SIMT `alloc_local((N,))` 现在会在 pointer-mode codegen 中按静态展开的 thread-local vector array 处理
 - 对包含 thread-local local array 的静态小循环，codegen 现在会在生成阶段做常量传播和展开
+- 带 `threadIdx` 的全局 `load/store` 现在会生成显式 mask
+- lowered TIR `T.Cast(...)` 现在已映射到 `tl.cast(...)`
+- 临时 tensor 的静态索引元素访问现在可按需拆成独立的 lane-vector SSA 名称
 - lowered TIR `dynamic m/n/k` 符号现在能正确映射到 launcher 维度 `M/N/K`
 - lowered TIR `T.gemm_py(...)` 现在能走 pointer-mode MMA lowering
-- 这几项修复共同打通了 `examples/dynamic_shape/example_dynamic.py` 和 `examples/hadamard_transform/example_hadamard.py`
+- 这几项修复共同打通了 `examples/dynamic_shape/example_dynamic.py`、`examples/hadamard_transform/example_hadamard.py` 和 `examples/gemv/example_gemv.py` 的 `naive_gemv(128,128,128,128)` 路径
+
+### `gemv` 的最新结论
+- `naive_gemv(128, 128, 128, 128)` 现在已经能在 TileLang / Gluon / PyTorch 三者之间完全对齐
+- 之前用来探路的 `naive_gemv(32, 32, 32, 32)` 不是稳定基线：
+  - TileLang 上游该配置本身会触发 `CUDA_ERROR_ILLEGAL_ADDRESS`
+  - 因此不适合作为 translator 精度回归
+- `gemv` 目录中更复杂的 `splitk_gemv*` / `*_tvm` 变体仍未接通
 
 ### `cast` 的最新根因
 - parser / transformer / JITKernel / TIR 入口 / fragment 向量化 / 1D->2D broadcast lowering 都已接通

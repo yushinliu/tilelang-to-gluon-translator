@@ -3,18 +3,20 @@
 ## 2026-03-12 SIMT/Hadamard 计划更新
 
 ### 已完成
+- `gemv` 新增一条真实 GPU 回归并通过：`naive_gemv(128, 128, 128, 128)`
 - `hadamard_transform` 已新增真实 GPU 回归并通过
 - lowered TIR `threadIdx` 已接通到 pointer-mode codegen
 - `T.tvm_warp_shuffle(...)` 已通过 Gluon `inline_asm_elementwise("shfl.sync.idx.b32")` 接通
 - 对含 thread-local local array 的静态小循环，codegen 已支持常量传播和展开
 
 ### 当前收益
+- `examples/gemv/example_gemv.py` 的基础 `naive_gemv` 路径已能真实转换到 Gluon 并在 GPU 上通过精度验证
 - `examples/hadamard_transform/example_hadamard.py` 已能真实转换到 Gluon 并在 GPU 上通过精度验证
 - 这条路径证明当前 translator 已具备一条最小可用的 SIMT local-array + warp-shuffle lowering 链
 
 ### 下一步拆分
 1. **继续推进未覆盖 SIMT 类 examples**
-   - `gemv`
+   - `gemv` 里的 `splitk_gemv*` / `*_tvm` 变体
    - `linear_attention`
    - 选择一个不依赖额外上游布局修复的 `flash_decoding` / `attention_sink` 入口先做 probe
 2. **收敛 thread-local lowering 的泛化边界**
