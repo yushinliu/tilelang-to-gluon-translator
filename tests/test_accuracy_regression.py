@@ -11,10 +11,40 @@ import tilelang
 import tilelang.language as T
 from pathlib import Path
 import sys
+import importlib.util
+import types
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tilelang_to_gluon_translator import to_gluon
+
+
+EXAMPLES_ROOT = Path("/mnt/d/yuliu/ws/tilelang/examples")
+
+
+def _load_example_module(name: str, rel_path: str):
+    module_path = EXAMPLES_ROOT / rel_path
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_example_module_with_stubs(name: str, rel_path: str, stubs: dict[str, object]):
+    saved = {}
+    try:
+        for mod_name, stub in stubs.items():
+            saved[mod_name] = sys.modules.get(mod_name)
+            sys.modules[mod_name] = stub
+        return _load_example_module(name, rel_path)
+    finally:
+        for mod_name, prev in saved.items():
+            if prev is None:
+                sys.modules.pop(mod_name, None)
+            else:
+                sys.modules[mod_name] = prev
 
 
 def _assert_plain_kernel_rejected(fn, *args):
@@ -161,3 +191,106 @@ class TestExamplesStrictCompatibility:
         kernel(a, b, out)
         assert torch.allclose(out, ref, rtol=1e-2, atol=1e-1)
         assert kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_simt_gemv_thread_binding_lowers_in_pointer_mode(self, device):
+        @tilelang.jit(out_idx=[-1])
+        def simt_gemv_const():
+            N, K = 32, 32
+            dtype = T.float16
+            accum_dtype = T.float32
+
+            @T.prim_func
+            def gemv(A: T.Tensor((K,), dtype), B: T.Tensor((N, K), dtype), C: T.Tensor((N,), dtype)):
+                with T.Kernel(1, threads=N) as bx:
+                    tx = T.get_thread_binding(0)
+                    C_local = T.alloc_local((1,), accum_dtype)
+                    T.clear(C_local)
+                    for k in T.serial(K):
+                        C_local[0] += A[k].astype(accum_dtype) * B[tx, k].astype(accum_dtype)
+                    C[tx] = C_local[0]
+
+            return gemv
+
+        kernel = to_gluon(simt_gemv_const, max_jobs=8, verify=False)
+        a = torch.randn(32, device=device, dtype=torch.float16)
+        b = torch.randn(32, 32, device=device, dtype=torch.float16)
+        out = torch.zeros(32, device=device, dtype=torch.float16)
+        ref = torch.matmul(b.to(torch.float32), a.to(torch.float32)).to(torch.float16)
+
+        kernel(a, b, out)
+        assert torch.allclose(out, ref, rtol=1e-2, atol=1e-2)
+        assert kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    @pytest.mark.xfail(
+        reason="Instantiated TIR cast still relies on scalar fragment indexing not yet vectorized in pointer-mode Gluon lowering."
+    )
+    def test_instantiated_cast_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_cast", "cast/example_per_token_cast_to_fp8.py")
+
+        tilelang_kernel = module.per_token_cast_to_fp8(256, 256, 8)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        x = torch.randn(256, 256, device=device, dtype=torch.float32)
+        tl_fp8, tl_amax = tilelang_kernel(x)
+        gl_fp8, gl_amax = gluon_kernel(x)
+
+        assert torch.allclose(tl_fp8.to(torch.float32), gl_fp8.to(torch.float32), rtol=1e-2, atol=1e-2)
+        assert torch.allclose(tl_amax, gl_amax, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_topk_example_jitkernel_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_topk", "topk/example_topk.py")
+
+        tilelang_kernel = module.tl_topk(M=320, N=128, topk=6, blk_m=64)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        logits = torch.rand(320, 128, device=device, dtype=torch.float32)
+        tl_gates, tl_indices = tilelang_kernel(logits)
+        gl_gates, gl_indices = gluon_kernel(logits)
+
+        assert torch.allclose(tl_gates, gl_gates, rtol=1e-2, atol=1e-2)
+        assert torch.equal(tl_indices, gl_indices)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_dynamic_shape_matmul_matches_tilelang(self, device):
+        module = _load_example_module("tl_example_dynamic", "dynamic_shape/example_dynamic.py")
+
+        tilelang_kernel = module.matmul_dynamic_mnk(64, 64, 32, False, False, "float16", "float16", "float32", 3, 128)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        a = torch.randn(128, 96, device=device, dtype=torch.float16)
+        b = torch.randn(96, 160, device=device, dtype=torch.float16)
+        tl_out = torch.zeros(128, 160, device=device, dtype=torch.float16)
+        gl_out = torch.zeros(128, 160, device=device, dtype=torch.float16)
+
+        tilelang_kernel(a, b, tl_out)
+        result = gluon_kernel(a, b, gl_out)
+        if isinstance(result, torch.Tensor):
+            gl_out = result
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True
+
+    @pytest.mark.gpu
+    def test_instantiated_hadamard_example_jitkernel_matches_tilelang(self, device):
+        scipy_stub = types.ModuleType("scipy")
+        scipy_stub.linalg = types.SimpleNamespace(hadamard=lambda *args, **kwargs: None)
+        module = _load_example_module_with_stubs(
+            "tl_example_hadamard",
+            "hadamard_transform/example_hadamard.py",
+            {"scipy": scipy_stub},
+        )
+
+        tilelang_kernel = module.hadamard(2, 256, module.T.float32)
+        gluon_kernel = to_gluon(tilelang_kernel, max_jobs=8, verify=False)
+
+        x = torch.randn(2, 256, device=device, dtype=torch.float32)
+        tl_out = tilelang_kernel(x)
+        gl_out = gluon_kernel(x)
+
+        assert torch.allclose(tl_out, gl_out, rtol=1e-2, atol=1e-2)
+        assert gluon_kernel.translator.use_pointer_mode is True

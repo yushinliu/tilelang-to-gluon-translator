@@ -31,7 +31,7 @@ class GluonKernelCache:
 
     def __init__(self, cache_dir: Optional[Union[str, Path]] = None):
         self.memory_cache: Dict[str, Any] = {}
-        self.cache_version = "v2"
+        self.cache_version = "v3"
         if cache_dir is None:
             self.cache_dir = Path.home() / ".cache" / "tilelang-to-gluon"
         else:
@@ -102,6 +102,7 @@ class TileLangGluonWrapper:
         self._gluon_source = None
         self._fallback_to_original = False
         self._auto_pointer_retry_attempted = False
+        self._parsed_kernel = None
 
         # Extract source code
         self.source_code = self._extract_source(func)
@@ -109,6 +110,19 @@ class TileLangGluonWrapper:
         self._has_fragment_subscript_elementwise = self._detect_fragment_subscript_elementwise(
             self.source_code
         )
+        if self._requires_simt_pointer_mode():
+            self.translator = TileLangToGluonTranslator(
+                max_jobs=self.translator.max_jobs,
+                verify=self.translator.verify,
+                atol=self.translator.atol,
+                rtol=self.translator.rtol,
+                check_version=True,
+                use_pointer_mode=True,
+            )
+        try:
+            self._parsed_kernel = self.translator.parser.parse(self.source_code)
+        except Exception:
+            self._parsed_kernel = None
 
         # Set environment
         os.environ['MAX_JOBS'] = str(max_jobs)
@@ -152,6 +166,17 @@ class TileLangGluonWrapper:
     def _extract_source(self, func: Callable) -> str:
         """Extract source code from function."""
         try:
+            # Handle @tilelang.autotune wrapped objects by unwrapping to the
+            # underlying JIT implementation, which still carries func_source.
+            if hasattr(func, "jit_impl"):
+                return self._extract_source(func.jit_impl)
+
+            # Handle instantiated JITKernel objects via their lowered PrimFunc.
+            if hasattr(func, "prim_func"):
+                prim_func = getattr(func, "prim_func")
+                if hasattr(prim_func, "script"):
+                    return prim_func.script()
+
             # Check if this is a @tilelang.jit wrapped function (JITImpl)
             # JITImpl objects have func_source attribute with the original source
             if hasattr(func, 'func_source') and isinstance(func.func_source, str):
@@ -363,8 +388,17 @@ class TileLangGluonWrapper:
         launcher_name = None
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                # The launcher doesn't have the _kernel suffix
-                if not node.name.endswith('_kernel') and not node.name.startswith('_'):
+                is_gluon_kernel = any(
+                    (
+                        isinstance(decorator, ast.Attribute)
+                        and decorator.attr == "jit"
+                    ) or (
+                        isinstance(decorator, ast.Name)
+                        and decorator.id == "jit"
+                    )
+                    for decorator in node.decorator_list
+                )
+                if not is_gluon_kernel and not node.name.startswith('_'):
                     launcher_name = node.name
                     break
 
@@ -385,6 +419,73 @@ class TileLangGluonWrapper:
     def _has_atomic_add(self) -> bool:
         """Return whether the extracted TileLang source uses atomic adds."""
         return "T.atomic_add(" in self.source_code
+
+    def _requires_simt_pointer_mode(self) -> bool:
+        """SIMT-style kernels currently require pointer mode lowering."""
+        simt_markers = (
+            "T.get_thread_binding(",
+            "T.get_thread_bindings(",
+            "T.vectorized(",
+            "T.launch_thread(",
+            "T.match_buffer(",
+        )
+        return (
+            not self.translator.use_pointer_mode
+            and any(marker in self.source_code for marker in simt_markers)
+        )
+
+    def _torch_dtype_for_annotation(self, dtype: str) -> Optional[torch.dtype]:
+        mapping = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "float64": torch.float64,
+            "bfloat16": torch.bfloat16,
+            "int8": torch.int8,
+            "int16": torch.int16,
+            "int32": torch.int32,
+            "int64": torch.int64,
+            "uint8": torch.uint8,
+            "float8_e4m3fn": torch.float8_e4m3fn,
+        }
+        return mapping.get(dtype)
+
+    def _materialize_missing_outputs(self, torch_args):
+        """Auto-allocate trailing output tensors for instantiated JIT kernels."""
+        if self._parsed_kernel is None:
+            return torch_args
+
+        tensor_params = [
+            param for param in self._parsed_kernel.params
+            if param.get("annotation", {}).get("type") == "Tensor"
+        ]
+        missing = len(tensor_params) - len(torch_args)
+        if missing <= 0:
+            return torch_args
+
+        output_names = list(getattr(self._parsed_kernel, "output_params", []))
+        if len(output_names) < missing:
+            return torch_args
+
+        if not torch_args or not isinstance(torch_args[0], torch.Tensor):
+            return torch_args
+
+        device = torch_args[0].device
+        existing_names = {param["name"] for param in tensor_params[:len(torch_args)]}
+        result = list(torch_args)
+
+        for param in tensor_params[len(torch_args):]:
+            if param["name"] not in output_names or param["name"] in existing_names:
+                return torch_args
+            annotation = param.get("annotation", {})
+            shape = annotation.get("shape", [])
+            if not all(isinstance(dim, int) for dim in shape):
+                return torch_args
+            dtype = self._torch_dtype_for_annotation(annotation.get("dtype", "float32"))
+            if dtype is None:
+                return torch_args
+            result.append(torch.empty(tuple(shape), device=device, dtype=dtype))
+
+        return result
 
     def _installed_gluon_version(self) -> tuple[int, int]:
         """Return installed Gluon major/minor version when available."""
@@ -447,6 +548,7 @@ class TileLangGluonWrapper:
                 torch_args.append(arg)
             else:
                 torch_args.append(arg)
+        torch_args = self._materialize_missing_outputs(torch_args)
 
         try:
             return self._compiled_kernel(*torch_args, **kwargs)

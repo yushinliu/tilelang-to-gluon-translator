@@ -1,5 +1,75 @@
 # TileLang to Gluon 测试实现状态报告
 
+## 2026-03-12 当前状态（`hadamard_transform` 新增通过，`cast` 仍是唯一 `xfail`）
+
+### 当前回归
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q tests/test_accuracy_regression.py tests/test_examples_p0.py tests/test_examples_p1.py tests/test_examples_p2.py tests/test_examples_source_p0.py
+# 结果: 59 passed, 1 xfailed
+```
+
+### 本轮确认
+- `tests/test_accuracy_regression.py::test_instantiated_hadamard_example_jitkernel_matches_tilelang` 已新增并真实通过
+- `tests/test_accuracy_regression.py::test_instantiated_topk_example_jitkernel_matches_tilelang` 已经真实通过，已去掉 `xfail`
+- `tests/test_accuracy_regression.py::test_instantiated_dynamic_shape_matmul_matches_tilelang` 已新增并通过
+- 当前唯一剩余的 upstream instantiated example 阻塞是 `cast`
+
+### 本轮新增通用能力
+- lowered TIR `threadIdx` + `T.tvm_warp_shuffle(...)` 已接通一条最小可用的 SIMT 路径
+- SIMT `alloc_local((N,))` 现在会在 pointer-mode codegen 中按静态展开的 thread-local vector array 处理
+- 对包含 thread-local local array 的静态小循环，codegen 现在会在生成阶段做常量传播和展开
+- lowered TIR `dynamic m/n/k` 符号现在能正确映射到 launcher 维度 `M/N/K`
+- lowered TIR `T.gemm_py(...)` 现在能走 pointer-mode MMA lowering
+- 这几项修复共同打通了 `examples/dynamic_shape/example_dynamic.py` 和 `examples/hadamard_transform/example_hadamard.py`
+
+### `cast` 的最新根因
+- parser / transformer / JITKernel / TIR 入口 / fragment 向量化 / 1D->2D broadcast lowering 都已接通
+- `X_amax` 已与 TileLang 对齐，说明 reduce 和 scale 路径正确
+- 独立 Gluon probe 进一步确认：
+  - 2D blocked 和 row-wise 1D 路径上的 float32 计算值本身与 PyTorch 参考对齐
+  - 但“计算得到的 float32 SSA 值 -> FP8”在 Gluon 3.6 上会表现出 **toward-zero** 偏差，而不是期望的 RTNE
+  - 直接把已加载的 float32 向量 cast 到 FP8 是正确的，因此问题更像是 Gluon 运行时对 computed SSA value 的 FP8 rounding 缺陷，而不是 translator 自己的布局 lowering
+
+### 对发布门槛的影响
+- 当前仍不能准备 `0.0.2`
+- 原因已收敛为两类：
+  - `/mnt/d/yuliu/ws/tilelang/examples` 仍未全覆盖
+  - `cast` 真实 example 仍未通过 GPU 精度验证
+
+## 2026-03-10 当前状态（最小 SIMT lowering 已落地）
+
+### 本轮新增能力
+- 已参考 `/mnt/d/yuliu/Triton-distributed` 的 `simt_exec_region` 语义，在当前 translator 中补齐最小可用的 SIMT lowering
+- 当前已支持的最小语义集合：
+  - `T.get_thread_binding(...)`
+  - `T.vectorized(...)`（先按 serial 保 correctness）
+  - pointer mode 下的全局 1D/2D 下标 `load/store`
+  - local `(1,)` accumulator
+  - `.astype(...)` 到 Gluon `.to(...)`
+  - 基础算术、比较、`+=`
+
+### 新增验证
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q tests/test_accuracy_regression.py
+# 结果: 21 passed, 2 warnings
+```
+
+其中新增了一条真实 GPU 回归：
+- `tests/test_accuracy_regression.py::TestExamplesStrictCompatibility::test_simt_gemv_thread_binding_lowers_in_pointer_mode`
+- 该测试使用 TileLang 风格的最小 SIMT GEMV，已在 GPU 上转换并通过精度验证
+
+### 现有已覆盖集回归
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q tests/test_examples_p0.py tests/test_examples_p1.py tests/test_examples_p2.py tests/test_examples_source_p0.py
+# 结果: 35 passed, 32 warnings
+```
+
+### 对 `examples/gemv` 的最新结论
+- 当前最小 SIMT lowering 已经不是主要阻塞
+- 真正的 `examples/gemv/example_gemv.py::naive_gemv` 仍未直接接通，剩余问题有两个：
+  - example 返回的是已编译的 `tilelang.jit.kernel.JITKernel`，当前 `to_gluon` 还不能直接从这类对象恢复高层 TileLang 源码
+  - 该 example 的 TileLang 侧 `PrimFunc` 本身会产生 `tn >= 32` 的越界告警，说明它依赖更复杂的逻辑线程/producer-consumer 语义，不能简单视作“threads=32 的普通 SIMT kernel”
+
 ## 2026-03-09 当前状态（Triton 3.6.0，仍未满足 0.0.2 发布门槛）
 
 ### 当前结论
@@ -451,3 +521,71 @@ src/
 - **TileLang 测试**：✅ 3/7 通过，可验证 TileLang kernel 正确性
 - **Gluon 转换**：⚠️  框架完成，codegen 需要修复
 - **总体进度**：约 60%，核心功能已可用
+# TileLang to Gluon 测试状态
+
+## 2026-03-10 JITKernel/TIR 回归更新
+
+### 新增能力
+- `to_gluon(...)` 现在可以直接接收 TileLang 已实例化的 `JITKernel`
+- 会从 `kernel.prim_func.script()` 进入最小 TIR 翻译路径
+- parser 已支持这批 lowered-TIR 语义：
+  - `T.match_buffer`
+  - `T.launch_thread`
+  - `T.alloc_buffer(scope="local.fragment")`
+  - `T.parallel(...)`
+  - `T.copy(...)`
+  - `T.reduce(..., "max"/"absmax", ...)`
+  - `T.fill(...)`
+- pointer-mode launcher 已支持从 TIR `T.writes(...)` / 全局写回推断多输出返回
+
+### 当前 GPU 回归结果
+- 已覆盖套件：
+  - `56 passed, 2 xfailed`
+- 命令：
+```bash
+/home/yuliu/miniconda3/bin/python -m pytest -q \
+  tests/test_accuracy_regression.py \
+  tests/test_examples_p0.py \
+  tests/test_examples_p1.py \
+  tests/test_examples_p2.py \
+  tests/test_examples_source_p0.py
+```
+
+### 新接入但仍未打通的真实 upstream examples
+- `cast/example_per_token_cast_to_fp8.py`
+  - 当前状态：`xfail`
+  - 当前更精确阻塞：
+    - `absmax` / 量化主路径已恢复
+    - 现在卡在 1D blocked 向量写回 2D 全局 tensor `X_amax[row, group]` 时的 Gluon layout mismatch
+- `topk/example_topk.py`
+  - 当前状态：`xfail`
+  - 当前更精确阻塞：`compare/select` 里 `BlockedLayout` / `SliceLayout` 广播到 `NVMMADistributedLayout` 时 layout mismatch
+
+### 未覆盖目录梳理
+- 仍未进入真实转换验证的目录：
+  - `analyze`
+  - `attention_sink`
+  - `blocksparse_attention`
+  - `cast`
+  - `deepseek_deepgemm`
+  - `deepseek_mhc`
+  - `deepseek_mla`
+  - `deepseek_nsa`
+  - `deepseek_v32`
+  - `flash_decoding`
+  - `fusedmoe`
+  - `gdn`
+  - `gemm_sp`
+  - `gemv`
+  - `kda`
+  - `linear_attention`
+  - `minference`
+  - `seer_attention`
+  - `sparse_tensorcore`
+  - `topk`
+  - `warp_specialize`
+
+### 当前结论
+- 已覆盖子集继续全绿
+- 现在已经能对真实 `JITKernel` 做翻译和回归挂钩
+- 但 `cast/topk` 仍未通过精度验证，因此“examples 全量可转换且精度对齐”的发布门槛仍未满足

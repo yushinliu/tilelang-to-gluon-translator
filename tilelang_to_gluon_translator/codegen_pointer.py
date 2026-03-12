@@ -32,13 +32,19 @@ class GluonPointerCodeGenerator:
         self.block_M = 32
         self.block_N = 32
         self.block_K = 32
+        self.vector_name_counter = 0
         self.has_runtime_dot_operand_layout = self._detect_dot_operand_layout()
         self.has_runtime_mma_v2 = self._detect_mma_v2()
+        self.loop_constant_env = {}
 
     def generate(self, kernel: GluonKernel) -> str:
         """Generate Gluon kernel source code using pointer mode."""
         self.lines = []
         self.kernel = kernel
+        self.vector_name_counter = 0
+        self.loop_constant_env = {}
+        self.store_passthrough = {}
+        self.symbol_aliases = self._infer_symbol_aliases()
         self.allocs = {
             alloc.name: alloc for alloc in list(kernel.shared_allocs) + list(getattr(kernel, "register_tensors", []))
         }
@@ -54,6 +60,22 @@ class GluonPointerCodeGenerator:
     def _indent(self) -> str:
         """Get current indentation string."""
         return "    " * self.indent_level
+
+    def _infer_symbol_aliases(self) -> dict[str, str]:
+        """Infer dynamic TIR shape symbols that should map to launcher dims."""
+        aliases = {}
+        for param in getattr(self.kernel, "params", []):
+            shape = param.get("shape", []) or []
+            for dim in shape:
+                if not isinstance(dim, str):
+                    continue
+                if dim == "m":
+                    aliases[dim] = "M"
+                elif dim == "n":
+                    aliases[dim] = "N"
+                elif dim == "k":
+                    aliases[dim] = "K"
+        return aliases
 
     def _generate_imports(self):
         """Generate import statements."""
@@ -98,6 +120,13 @@ class GluonPointerCodeGenerator:
             f"BLOCK_N: gl.constexpr = {self.block_N}",
             f"BLOCK_K: gl.constexpr = {self.block_K}",
         ]
+        thread_dims = list(getattr(kernel, "thread_dims", [kernel.num_warps * 32, 1, 1]))
+        thread_dims += [1] * (3 - len(thread_dims))
+        constexpr_params.extend([
+            f"THREADS_X: gl.constexpr = {thread_dims[0]}",
+            f"THREADS_Y: gl.constexpr = {thread_dims[1]}",
+            f"THREADS_Z: gl.constexpr = {thread_dims[2]}",
+        ])
 
         # Add additional block symbols
         for sym in self._collect_block_symbols(kernel):
@@ -118,6 +147,9 @@ class GluonPointerCodeGenerator:
         # Get program IDs
         self.lines.append(f"{self._indent()}pid_m = gl.program_id(0)")
         self.lines.append(f"{self._indent()}pid_n = gl.program_id(1)")
+        for dim, var_name in enumerate(getattr(kernel, "thread_var_names", [None, None, None])):
+            if var_name:
+                self.lines.append(f"{self._indent()}{var_name} = {self._thread_binding_expr(dim)}")
 
         # Compute offsets - use simple integer arithmetic for pointer mode
         # Note: In pointer mode, we don't need tl.arange with layout
@@ -165,10 +197,23 @@ class GluonPointerCodeGenerator:
     def _generate_register_tensor(self, stmt: GluonRegisterTensor):
         """Generate register tensor allocation (local accumulator)."""
         # Register fragments must preserve the transformed layout metadata.
-        shape_str = str(stmt.shape).replace("'", "") if stmt.shape else "(1,)"
-        layout = stmt.layout if getattr(stmt, "layout", None) else (
-            self._blocked_layout_expr(*stmt.shape[:2]) if len(stmt.shape) >= 2 else "gl.BlockedLayout([1], [32], [4], [0])"
-        )
+        if getattr(stmt, "is_thread_local", False):
+            extent = stmt.shape[0] if stmt.shape else 1
+            self.lines.append(f"{self._indent()}# Initialize thread-local vector array")
+            for idx in range(extent):
+                self.lines.append(
+                    f"{self._indent()}{self._thread_local_elem_name(stmt.name, idx)} = "
+                    f"gl.full([THREADS_X], 0, {stmt.dtype}, layout={self._thread_binding_layout_expr()})"
+                )
+            return
+        elif list(stmt.shape or []) == [1]:
+            shape_str = "[THREADS_X]"
+            layout = self._thread_binding_layout_expr()
+        else:
+            shape_str = str(stmt.shape).replace("'", "") if stmt.shape else "(1,)"
+            layout = stmt.layout if getattr(stmt, "layout", None) else (
+                self._blocked_layout_expr(*stmt.shape[:2]) if len(stmt.shape) >= 2 else "gl.BlockedLayout([1], [32], [4], [0])"
+            )
         self.lines.append(f"{self._indent()}# Initialize register tensor")
         self.lines.append(f"{self._indent()}{stmt.name} = gl.full({shape_str}, 0, {stmt.dtype}, layout={layout})")
 
@@ -231,6 +276,24 @@ class GluonPointerCodeGenerator:
             self.lines.append(f"{self._indent()}{stmt.acc}_dot = tl.dot({A_var}_dot, {B_var}_dot, acc={stmt.acc})")
             self.lines.append(f"{self._indent()}{stmt.acc} = gl.convert_layout({stmt.acc}_dot, acc_layout)")
 
+    def _mma_lines(self, a_var: str, b_var: str, acc_var: str) -> list[str]:
+        """Emit pointer-mode MMA lines for lowered TIR helper calls."""
+        layout_ctor = "gl.DotOperandLayout" if self.has_runtime_dot_operand_layout else "DotOperandLayout"
+        k_width = self._dot_k_width_literal(a_var, b_var)
+        lines = [
+            f"acc_layout: gl.constexpr = {acc_var}.type.layout",
+            f"a_layout: gl.constexpr = {layout_ctor}(parent=acc_layout, operand_index=0, k_width={k_width})",
+            f"b_layout: gl.constexpr = {layout_ctor}(parent=acc_layout, operand_index=1, k_width={k_width})",
+            f"{a_var}_dot = gl.convert_layout({a_var}, a_layout)",
+            f"{b_var}_dot = gl.convert_layout({b_var}, b_layout)",
+        ]
+        if self.has_runtime_mma_v2:
+            lines.append(f"{acc_var} = mma_v2({a_var}_dot, {b_var}_dot, {acc_var})")
+        else:
+            lines.append(f"{acc_var}_dot = tl.dot({a_var}_dot, {b_var}_dot, acc={acc_var})")
+            lines.append(f"{acc_var} = gl.convert_layout({acc_var}_dot, acc_layout)")
+        return lines
+
     def _fix_expr(self, expr):
         """Convert expression string from parser format to Python format.
 
@@ -253,6 +316,8 @@ class GluonPointerCodeGenerator:
         result = expr
         for old, new in replacements.items():
             result = result.replace(old, new)
+        for symbol, alias in self.symbol_aliases.items():
+            result = re.sub(rf"\b{re.escape(symbol)}\b", alias, result)
         return result
 
     def _generate_tma_load(self, stmt: GluonTmaLoad):
@@ -304,6 +369,7 @@ class GluonPointerCodeGenerator:
             dst_idx = stmt.dst_indices if stmt.dst_indices else ["0", "0"]
             # Fix expressions (convert 'mult' to '*', etc.)
             dst_idx = [self._fix_expr(i) for i in dst_idx]
+            store_value = self.store_passthrough.get(stmt.smem, stmt.smem)
             self.lines.append(f"{self._indent()}# Store {stmt.smem} to {stmt.dst_tensor}")
             alloc = self.allocs.get(stmt.smem)
             shape = getattr(alloc, "shape", None) or []
@@ -323,13 +389,13 @@ class GluonPointerCodeGenerator:
                 self.lines.append(
                     f"{self._indent()}mask_out = (rows_out[:, None] < M) & (cols_out[None, :] < N)"
                 )
-                self.lines.append(f"{self._indent()}gl.store(ptr_out, {stmt.smem}, mask=mask_out)")
+                self.lines.append(f"{self._indent()}gl.store(ptr_out, {store_value}, mask=mask_out)")
             else:
                 if len(dst_idx) >= 2:
                     self.lines.append(f"{self._indent()}ptr_out = {stmt.dst_tensor} + ({dst_idx[0]}) * N + ({dst_idx[1]})")
                 else:
                     self.lines.append(f"{self._indent()}ptr_out = {stmt.dst_tensor} + {dst_idx[0] if dst_idx else '0'}")
-                self.lines.append(f"{self._indent()}gl.store(ptr_out, {stmt.smem})")
+                self.lines.append(f"{self._indent()}gl.store(ptr_out, {store_value})")
         else:
             # Fallback to simple store
             tensor_params = [p['name'] for p in self.kernel.params]
@@ -345,6 +411,14 @@ class GluonPointerCodeGenerator:
         if block_atomic is not None:
             self._generate_block_atomic_add(*block_atomic)
             return
+
+        if self._generate_unrolled_loop(stmt):
+            return
+
+        checkpoint = len(self.lines)
+        if self._try_generate_vectorized_loop(stmt):
+            return
+        self.lines = self.lines[:checkpoint]
 
         start_str = str(stmt.start)
         end_str = str(stmt.end)
@@ -362,6 +436,9 @@ class GluonPointerCodeGenerator:
         end_str = replace_ceildiv(end_str)
         start_str = replace_ceildiv(start_str)
         step_str = replace_ceildiv(step_str)
+        end_str = self._fix_expr(end_str)
+        start_str = self._fix_expr(start_str)
+        step_str = self._fix_expr(step_str)
 
         self.lines.append(
             f"{self._indent()}for {stmt.var} in range({start_str}, {end_str}, {step_str}):"
@@ -371,15 +448,7 @@ class GluonPointerCodeGenerator:
         for body_stmt in stmt.body:
             if body_stmt:
                 if isinstance(body_stmt, ast.AST):
-                    try:
-                        if hasattr(ast, 'unparse'):
-                            source = ast.unparse(body_stmt).strip()
-                        else:
-                            import astor
-                            source = astor.to_source(body_stmt).strip()
-                        self.lines.append(f"{self._indent()}{source}")
-                    except Exception:
-                        pass
+                    self._generate_raw_ast(body_stmt)
                 else:
                     self._generate_stmt(body_stmt)
 
@@ -387,19 +456,32 @@ class GluonPointerCodeGenerator:
 
     def _generate_raw_ast(self, stmt: ast.AST):
         """Emit preserved Python AST statements."""
-        try:
-            if hasattr(ast, "unparse"):
-                source = ast.unparse(stmt).strip()
-            else:
-                import astor
-                source = astor.to_source(stmt).strip()
-            if source:
-                self.lines.append(f"{self._indent()}{source}")
-        except Exception:
-            pass
+        lowered = self._lower_ast_stmt(stmt)
+        if lowered is None:
+            try:
+                if hasattr(ast, "unparse"):
+                    source = ast.unparse(stmt).strip()
+                else:
+                    import astor
+                    source = astor.to_source(stmt).strip()
+                if source:
+                    self.lines.append(f"{self._indent()}{source}")
+            except Exception:
+                pass
+            return
+        for line in lowered:
+            self.lines.append(f"{self._indent()}{line}")
 
     def _generate_clear(self, stmt: GluonClear):
         """Generate clear operation."""
+        if self._is_thread_local_tensor(stmt.buffer):
+            extent = (getattr(self.allocs.get(stmt.buffer), "shape", None) or [1])[0]
+            for idx in range(extent):
+                self.lines.append(
+                    f"{self._indent()}{self._thread_local_elem_name(stmt.buffer, idx)} = "
+                    f"gl.full([THREADS_X], 0, {self._tensor_dtype(stmt.buffer)}, layout={self._thread_binding_layout_expr()})"
+                )
+            return
         layout = self._tensor_layout_expr(stmt.buffer)
         self.lines.append(
             f"{self._indent()}{stmt.buffer} = gl.full({stmt.buffer}.shape, 0, {stmt.buffer}.dtype, layout={layout})"
@@ -409,10 +491,21 @@ class GluonPointerCodeGenerator:
         """Generate in-kernel local/shared/register copy."""
         dst_layout = self._tensor_layout_expr(stmt.dst)
         src_layout = self._tensor_layout_expr(stmt.src)
+        src_expr = stmt.src
+        src_dtype = self._tensor_dtype(stmt.src)
+        dst_dtype = self._tensor_dtype(stmt.dst)
+        if src_dtype is not None and dst_dtype is not None and src_dtype != dst_dtype:
+            if (
+                self._is_floating_dtype(src_dtype)
+                and self._is_floating_dtype(dst_dtype)
+                and self._dtype_bitwidth(dst_dtype) < self._dtype_bitwidth(src_dtype)
+            ):
+                self.store_passthrough[stmt.dst] = stmt.src
+            src_expr = self._cast_expr(src_expr, src_dtype, dst_dtype)
         if dst_layout != f"{stmt.dst}.type.layout" and dst_layout != src_layout:
-            self.lines.append(f"{self._indent()}{stmt.dst} = gl.convert_layout({stmt.src}, {dst_layout})")
+            self.lines.append(f"{self._indent()}{stmt.dst} = gl.convert_layout({src_expr}, {dst_layout})")
         else:
-            self.lines.append(f"{self._indent()}{stmt.dst} = {stmt.src}")
+            self.lines.append(f"{self._indent()}{stmt.dst} = {src_expr}")
 
     def _generate_atomic_add(self, stmt: GluonAtomicAdd):
         """Generate atomic add into global memory."""
@@ -549,7 +642,10 @@ class GluonPointerCodeGenerator:
                 self.lines.append(f"{self._indent()}N = {first}.shape[1]")
                 self.lines.append(f"{self._indent()}K = {first}.shape[1]")
             if kernel.grid:
-                self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)})")
+                if len(kernel.grid) == 1:
+                    self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)},)")
+                else:
+                    self.lines.append(f"{self._indent()}grid = ({self._format_grid(kernel.grid)})")
             else:
                 self.lines.append(f"{self._indent()}grid = (_ceildiv(N, BLOCK_N), _ceildiv(M, BLOCK_M))")
 
@@ -558,7 +654,15 @@ class GluonPointerCodeGenerator:
             dim_args = "M=M, N=N, K=K"
             all_args = ", ".join([ptr_args, dim_args])
             self.lines.append(f"{self._indent()}{kernel.name}_kernel[grid]({all_args})")
-            self.lines.append(f"{self._indent()}return {tensor_params[-1]['name']}")
+            param_names = {p['name'] for p in tensor_params}
+            output_name_set = {name for name in getattr(kernel, "output_params", []) if name in param_names}
+            output_names = [p['name'] for p in tensor_params if p['name'] in output_name_set]
+            if len(output_names) > 1:
+                self.lines.append(f"{self._indent()}return ({', '.join(output_names)})")
+            elif len(output_names) == 1:
+                self.lines.append(f"{self._indent()}return {output_names[0]}")
+            else:
+                self.lines.append(f"{self._indent()}return {tensor_params[-1]['name']}")
         else:
             grid_str = ", ".join([str(g) for g in kernel.grid]) if kernel.grid else "1"
             self.lines.append(f"{self._indent()}grid = ({grid_str},)")
@@ -586,19 +690,33 @@ class GluonPointerCodeGenerator:
         for dim in grid:
             expr = str(dim)
             expr = expr.replace("block_M", "BLOCK_M").replace("block_N", "BLOCK_N").replace("block_K", "BLOCK_K")
+            for symbol, alias in self.symbol_aliases.items():
+                expr = re.sub(rf"\b{re.escape(symbol)}\b", alias, expr)
             expr = re.sub(r"\bceildiv\s*\(", "_ceildiv(", expr)
             rendered.append(expr)
         return ", ".join(rendered)
 
     def _row_stride_expr(self, tensor_name: str) -> str:
         """Return the contiguous row stride expression for a known tensor parameter."""
+        for param in self.kernel.params:
+            if param.get("name") != tensor_name:
+                continue
+            shape = param.get("shape", []) or []
+            if len(shape) >= 2:
+                return self._fix_expr(str(shape[1]))
         tensor_names = [p["name"] for p in self.kernel.params if p.get("type") == "tensor_descriptor"]
-        if tensor_name == tensor_names[0]:
+        if tensor_names and tensor_name == tensor_names[0]:
             return "K"
         return "N"
 
     def _dim_expr(self, tensor_name: str, axis: int) -> str:
         """Return symbolic extents for known matrix operands."""
+        for param in self.kernel.params:
+            if param.get("name") != tensor_name:
+                continue
+            shape = param.get("shape", []) or []
+            if len(shape) > axis:
+                return self._fix_expr(str(shape[axis]))
         tensor_names = [p["name"] for p in self.kernel.params if p.get("type") == "tensor_descriptor"]
         if tensor_name == tensor_names[0]:
             return "M" if axis == 0 else "K"
@@ -639,6 +757,43 @@ class GluonPointerCodeGenerator:
         }
         return bitwidth_map.get(base, 32)
 
+    def _dtype_bitwidth(self, dtype_expr: str) -> int:
+        """Infer primitive bitwidth from a Gluon dtype expression."""
+        base = dtype_expr.replace("gl.", "")
+        bitwidth_map = {
+            "float8e4nv": 8,
+            "float8e5": 8,
+            "float8e4b15": 8,
+            "float16": 16,
+            "bfloat16": 16,
+            "int16": 16,
+            "uint16": 16,
+            "float32": 32,
+            "int32": 32,
+            "uint32": 32,
+            "float64": 64,
+            "int64": 64,
+            "uint64": 64,
+            "int8": 8,
+            "uint8": 8,
+            "int1": 1,
+        }
+        return bitwidth_map.get(base, 32)
+
+    def _is_floating_dtype(self, dtype_expr: str) -> bool:
+        base = dtype_expr.replace("gl.", "")
+        return base.startswith("float") or base == "bfloat16"
+
+    def _cast_expr(self, expr: str, src_dtype: str, dst_dtype: str) -> str:
+        """Emit explicit RTNE for floating downcasts to match Triton/Torch FP8 semantics."""
+        if (
+            self._is_floating_dtype(src_dtype)
+            and self._is_floating_dtype(dst_dtype)
+            and self._dtype_bitwidth(dst_dtype) < self._dtype_bitwidth(src_dtype)
+        ):
+            return f'tl.cast({expr}, {dst_dtype}, fp_downcast_rounding="rtne")'
+        return f"{expr}.to({dst_dtype})"
+
     def _tensor_dtype(self, tensor_name: str) -> Optional[str]:
         """Resolve Gluon dtype for a known tensor/alloc name."""
         alloc = self.allocs.get(tensor_name)
@@ -655,6 +810,8 @@ class GluonPointerCodeGenerator:
         """Resolve a stable Gluon layout expression for a known tensor/alloc name."""
         alloc = self.allocs.get(tensor_name)
         if alloc is not None and getattr(alloc, "layout", None):
+            if getattr(alloc, "is_thread_local", False):
+                return self._thread_binding_layout_expr()
             shape = getattr(alloc, "shape", None) or []
             # Pointer mode represents shared buffers as loaded/register tensors, not real shared-memory handles.
             if "NVMMASharedLayout" in alloc.layout:
@@ -701,6 +858,814 @@ class GluonPointerCodeGenerator:
             return f"gl.BlockedLayout([{size}], [32], [{num_warps}], [0])"
         except Exception:
             return "gl.BlockedLayout([1], [32], [4], [0])"
+
+    def _thread_binding_layout_expr(self) -> str:
+        """Construct a simple 1D logical-thread layout."""
+        return "gl.BlockedLayout([1], [32], [num_warps], [0])"
+
+    def _thread_dim_symbol(self, dim: int) -> str:
+        mapping = {0: "THREADS_X", 1: "THREADS_Y", 2: "THREADS_Z"}
+        return mapping.get(dim, "THREADS_X")
+
+    def _thread_binding_expr(self, dim: int) -> str:
+        return (
+            f"gl.arange(0, {self._thread_dim_symbol(dim)}, "
+            f"layout={self._thread_binding_layout_expr()})"
+        )
+
+    def _is_global_tensor(self, name: str) -> bool:
+        return any(param.get("name") == name for param in getattr(self, "tensor_params", []))
+
+    def _tensor_rank(self, name: str) -> int:
+        for param in self.kernel.params:
+            if param.get("name") == name:
+                shape = param.get("shape", []) or []
+                return len(shape)
+        return 0
+
+    def _is_scalar_like_local(self, name: str) -> bool:
+        alloc = self.allocs.get(name)
+        if alloc is None:
+            return False
+        shape = getattr(alloc, "shape", None) or []
+        return list(shape) == [1]
+
+    def _is_thread_local_tensor(self, name: str) -> bool:
+        alloc = self.allocs.get(name)
+        return bool(alloc is not None and getattr(alloc, "is_thread_local", False))
+
+    def _thread_local_elem_name(self, name: str, idx: int) -> str:
+        return f"{name}_{idx}"
+
+    def _operator_str(self, op: ast.AST) -> str:
+        mapping = {
+            ast.Add: "+",
+            ast.Sub: "-",
+            ast.Mult: "*",
+            ast.Div: "/",
+            ast.FloorDiv: "//",
+            ast.Mod: "%",
+            ast.Pow: "**",
+            ast.BitAnd: "&",
+            ast.BitOr: "|",
+            ast.BitXor: "^",
+            ast.LShift: "<<",
+            ast.RShift: ">>",
+        }
+        return mapping[type(op)]
+
+    def _cmp_str(self, op: ast.AST) -> str:
+        mapping = {
+            ast.Eq: "==",
+            ast.NotEq: "!=",
+            ast.Lt: "<",
+            ast.LtE: "<=",
+            ast.Gt: ">",
+            ast.GtE: ">=",
+        }
+        return mapping[type(op)]
+
+    def _dtype_attr_expr(self, attr: str) -> str:
+        mapping = {
+            "float": "gl.float32",
+            "float8_e4m3fn": "gl.float8e4nv",
+            "float16": "gl.float16",
+            "float32": "gl.float32",
+            "float64": "gl.float64",
+            "bfloat16": "gl.bfloat16",
+            "int8": "gl.int8",
+            "int16": "gl.int16",
+            "int32": "gl.int32",
+            "int64": "gl.int64",
+            "uint8": "gl.uint8",
+            "uint16": "gl.uint16",
+            "uint32": "gl.uint32",
+            "uint64": "gl.uint64",
+        }
+        return mapping.get(attr, f"gl.{attr}")
+
+    def _subscript_indices(self, node: ast.Subscript) -> list[ast.AST]:
+        if isinstance(node.slice, ast.Tuple):
+            return list(node.slice.elts)
+        return [node.slice]
+
+    def _lower_global_ptr_expr(self, tensor_name: str, indices: list[ast.AST]) -> str:
+        lowered = [self._lower_ast_expr(idx) for idx in indices]
+        rank = self._tensor_rank(tensor_name)
+        if rank <= 1 or len(lowered) == 1:
+            return f"{tensor_name} + ({lowered[0]})"
+        if len(lowered) == 2:
+            return (
+                f"{tensor_name} + ({lowered[0]}) * {self._row_stride_expr(tensor_name)} "
+                f"+ ({lowered[1]})"
+            )
+        if len(lowered) == 3:
+            batch_stride = f"({self._dim_expr(tensor_name, 1)} * {self._dim_expr(tensor_name, 2)})"
+            return (
+                f"{tensor_name} + ({lowered[0]}) * {batch_stride} "
+                f"+ ({lowered[1]}) * {self._dim_expr(tensor_name, 2)} + ({lowered[2]})"
+            )
+        return f"{tensor_name} + ({lowered[0]})"
+
+    def _lower_ast_expr(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return self.symbol_aliases.get(node.id, node.id)
+        if isinstance(node, ast.Constant):
+            return repr(node.value)
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "T":
+                return self._dtype_attr_expr(node.attr)
+            return f"{self._lower_ast_expr(node.value)}.{node.attr}"
+        if isinstance(node, ast.BinOp):
+            return f"({self._lower_ast_expr(node.left)} {self._operator_str(node.op)} {self._lower_ast_expr(node.right)})"
+        if isinstance(node, ast.UnaryOp):
+            unary = {
+                ast.UAdd: "+",
+                ast.USub: "-",
+                ast.Not: "not ",
+                ast.Invert: "~",
+            }[type(node.op)]
+            return f"({unary}{self._lower_ast_expr(node.operand)})"
+        if isinstance(node, ast.BoolOp):
+            joiner = " and " if isinstance(node.op, ast.And) else " or "
+            return "(" + joiner.join(self._lower_ast_expr(v) for v in node.values) + ")"
+        if isinstance(node, ast.Compare):
+            left = self._lower_ast_expr(node.left)
+            parts = []
+            for op, comp in zip(node.ops, node.comparators):
+                parts.append(f"{left} {self._cmp_str(op)} {self._lower_ast_expr(comp)}")
+                left = self._lower_ast_expr(comp)
+            return "(" + " and ".join(parts) + ")"
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "T":
+                    if node.func.attr == "get_thread_binding":
+                        dim = int(node.args[0].value) if node.args else 0
+                        return self._thread_binding_expr(dim)
+                    if node.func.attr == "tvm_warp_shuffle":
+                        value_expr = self._lower_ast_expr(node.args[1])
+                        lane_expr = self._lower_ast_expr(node.args[2])
+                        return self._warp_shuffle_expr(value_expr, lane_expr)
+                    if node.func.attr == "shift_left":
+                        return f"({self._lower_ast_expr(node.args[0])} << {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "shift_right":
+                        return f"({self._lower_ast_expr(node.args[0])} >> {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "bitwise_xor":
+                        return f"({self._lower_ast_expr(node.args[0])} ^ {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "bitwise_and":
+                        return f"({self._lower_ast_expr(node.args[0])} & {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "bitwise_or":
+                        return f"({self._lower_ast_expr(node.args[0])} | {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "if_then_else":
+                        cond = self._lower_ast_expr(node.args[0])
+                        true_val = self._lower_ast_expr(node.args[1])
+                        false_val = self._lower_ast_expr(node.args[2])
+                        return f"tl.where({cond}, {true_val}, {false_val})"
+                    if node.func.attr == "max":
+                        return f"tl.maximum({self._lower_ast_expr(node.args[0])}, {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "min":
+                        return f"tl.minimum({self._lower_ast_expr(node.args[0])}, {self._lower_ast_expr(node.args[1])})"
+                    if node.func.attr == "bool":
+                        return self._lower_ast_expr(node.args[0])
+                    if node.func.attr in {
+                        "float16", "float32", "float64",
+                        "int8", "int16", "int32", "int64",
+                        "uint8", "uint16", "uint32", "uint64",
+                        "bfloat16",
+                    }:
+                        if not node.args:
+                            return self._dtype_attr_expr(node.func.attr)
+                        return self._lower_ast_expr(node.args[0])
+                if node.func.attr == "astype":
+                    base = self._lower_ast_expr(node.func.value)
+                    dtype_expr = self._lower_ast_expr(node.args[0])
+                    return f"{base}.to({dtype_expr})"
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+                args = ", ".join(self._lower_ast_expr(arg) for arg in node.args)
+                return f"{func_name}({args})"
+            if hasattr(ast, "unparse"):
+                return ast.unparse(node).strip()
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and self._is_thread_local_tensor(node.value.id):
+                indices = self._subscript_indices(node)
+                if len(indices) == 1:
+                    idx_value = self._eval_static_int_ast(indices[0])
+                    if idx_value is None:
+                        raise NotImplementedError(f"Dynamic thread-local index is not supported: {ast.unparse(indices[0])}")
+                    return self._thread_local_elem_name(node.value.id, idx_value)
+            if isinstance(node.value, ast.Name) and self._is_global_tensor(node.value.id):
+                ptr_expr = self._lower_global_ptr_expr(node.value.id, self._subscript_indices(node))
+                return f"gl.load({ptr_expr})"
+            if isinstance(node.value, ast.Name) and self._is_scalar_like_local(node.value.id):
+                indices = self._subscript_indices(node)
+                if len(indices) == 1 and isinstance(indices[0], ast.Constant) and indices[0].value == 0:
+                    return node.value.id
+            base = self._lower_ast_expr(node.value)
+            indices = ", ".join(self._lower_ast_expr(idx) for idx in self._subscript_indices(node))
+            return f"{base}[{indices}]"
+        if hasattr(ast, "unparse"):
+            return ast.unparse(node).strip()
+        raise NotImplementedError(f"Unsupported AST expression: {ast.dump(node)}")
+
+    def _lower_ast_store(self, target: ast.Subscript, value_expr: str) -> str:
+        if isinstance(target.value, ast.Name) and self._is_thread_local_tensor(target.value.id):
+            indices = self._subscript_indices(target)
+            if len(indices) == 1:
+                idx_value = self._eval_static_int_ast(indices[0])
+                if idx_value is None:
+                    raise NotImplementedError(f"Dynamic thread-local index is not supported: {ast.unparse(indices[0])}")
+                return f"{self._thread_local_elem_name(target.value.id, idx_value)} = {value_expr}"
+        if isinstance(target.value, ast.Name) and self._is_global_tensor(target.value.id):
+            ptr_expr = self._lower_global_ptr_expr(target.value.id, self._subscript_indices(target))
+            return f"gl.store({ptr_expr}, {value_expr})"
+        if isinstance(target.value, ast.Name) and self._is_scalar_like_local(target.value.id):
+            indices = self._subscript_indices(target)
+            if len(indices) == 1 and isinstance(indices[0], ast.Constant) and indices[0].value == 0:
+                return f"{target.value.id} = {value_expr}"
+        base = self._lower_ast_expr(target.value)
+        indices = ", ".join(self._lower_ast_expr(idx) for idx in self._subscript_indices(target))
+        return f"{base}[{indices}] = {value_expr}"
+
+    def _lower_ast_stmt(self, stmt: ast.AST) -> Optional[list[str]]:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            lowered = self._lower_ast_call_stmt(stmt.value)
+            if lowered is not None:
+                return lowered
+        if isinstance(stmt, ast.Assign):
+            if self._is_shape_symbol_declaration(stmt):
+                return []
+            if self._is_handle_declaration(stmt):
+                return []
+            value_expr = self._lower_ast_expr(stmt.value)
+            lines = []
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    lines.append(f"{target.id} = {value_expr}")
+                elif isinstance(target, ast.Subscript):
+                    lines.append(self._lower_ast_store(target, value_expr))
+                else:
+                    return None
+            return lines
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is None:
+                return []
+            if isinstance(stmt.target, ast.Name) and self._is_zero_arg_t_dtype_call(stmt.annotation):
+                return [f"{stmt.target.id} = {self._lower_ast_expr(stmt.value)}"]
+            if isinstance(stmt.target, ast.Name):
+                return [f"{stmt.target.id} = {self._lower_ast_expr(stmt.value)}"]
+            if isinstance(stmt.target, ast.Subscript):
+                value_expr = self._lower_ast_expr(stmt.value)
+                return [self._lower_ast_store(stmt.target, value_expr)]
+        if isinstance(stmt, ast.AugAssign):
+            if isinstance(stmt.target, ast.Subscript):
+                target_expr = self._lower_ast_expr(stmt.target)
+                value_expr = self._lower_ast_expr(stmt.value)
+                op = self._operator_str(stmt.op)
+                if isinstance(stmt.target.value, ast.Name) and self._is_global_tensor(stmt.target.value.id):
+                    return [self._lower_ast_store(stmt.target, f"{target_expr} {op} {value_expr}")]
+                return [f"{target_expr} = {target_expr} {op} {value_expr}"]
+            if isinstance(stmt.target, ast.Name):
+                value_expr = self._lower_ast_expr(stmt.value)
+                op = self._operator_str(stmt.op)
+                return [f"{stmt.target.id} = {stmt.target.id} {op} {value_expr}"]
+        if isinstance(stmt, ast.If):
+            lines = [f"if {self._lower_ast_expr(stmt.test)}:"]
+            body_lines = []
+            for inner in stmt.body:
+                lowered = self._lower_ast_stmt(inner)
+                if lowered is None:
+                    return None
+                body_lines.extend(f"    {line}" for line in lowered)
+            if not body_lines:
+                body_lines.append("    pass")
+            lines.extend(body_lines)
+            if stmt.orelse:
+                lines.append("else:")
+                else_lines = []
+                for inner in stmt.orelse:
+                    lowered = self._lower_ast_stmt(inner)
+                    if lowered is None:
+                        return None
+                    else_lines.extend(f"    {line}" for line in lowered)
+                if not else_lines:
+                    else_lines.append("    pass")
+                lines.extend(else_lines)
+            return lines
+        return None
+
+    def _is_zero_arg_t_dtype_call(self, node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "T"
+            and node.func.attr in {"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}
+            and not node.args
+        )
+
+    def _is_shape_symbol_declaration(self, stmt: ast.Assign) -> bool:
+        if len(stmt.targets) != 1:
+            return False
+        target = stmt.targets[0]
+        if isinstance(target, ast.Tuple):
+            if not isinstance(stmt.value, ast.Tuple) or len(target.elts) != len(stmt.value.elts):
+                return False
+            return all(isinstance(t, ast.Name) for t in target.elts) and all(
+                self._is_zero_arg_t_dtype_call(v) for v in stmt.value.elts
+            )
+        return isinstance(target, ast.Name) and self._is_zero_arg_t_dtype_call(stmt.value)
+
+    def _is_handle_declaration(self, stmt: ast.Assign) -> bool:
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return False
+        value = stmt.value
+        return (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "T"
+            and value.func.attr == "handle"
+        )
+
+    def _region_base_name(self, node: ast.AST) -> Optional[str]:
+        """Resolve the underlying buffer name from a T.region call."""
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "region" and node.args:
+                base = node.args[0]
+                if isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name):
+                    return base.value.id
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            return node.value.id
+        if isinstance(node, ast.Name):
+            return node.id
+        return None
+
+    def _lower_ast_call_stmt(self, call: ast.Call) -> Optional[list[str]]:
+        """Lower selected TileLang/TIR helper calls."""
+        if not isinstance(call.func, ast.Attribute):
+            return None
+        if not isinstance(call.func.value, ast.Name) or call.func.value.id != "T":
+            return None
+
+        if call.func.attr == "fill" and len(call.args) >= 2:
+            target = self._region_base_name(call.args[0])
+            if target is None:
+                return None
+            value_expr = self._lower_ast_expr(call.args[1])
+            layout_expr = self._tensor_layout_expr(target)
+            return [f"{target} = gl.full({target}.shape, {value_expr}, {target}.dtype, layout={layout_expr})"]
+
+        if call.func.attr == "block_attr":
+            return []
+
+        if call.func.attr == "reduce" and len(call.args) >= 4:
+            src = self._region_base_name(call.args[0])
+            dst = self._region_base_name(call.args[1])
+            if src is None or dst is None:
+                return None
+            op_kind = call.args[2].value if isinstance(call.args[2], ast.Constant) else None
+            axis_expr = self._lower_ast_expr(call.args[3])
+            dst_layout = self._tensor_layout_expr(dst)
+            if op_kind == "max":
+                return [f"{dst} = gl.convert_layout(tl.max({src}, axis={axis_expr}), {dst_layout})"]
+            if op_kind == "absmax":
+                return [f"{dst} = gl.convert_layout(tl.max(tl.abs({src}), axis={axis_expr}), {dst_layout})"]
+
+        if call.func.attr in {"gemm_py", "gemm"} and len(call.args) >= 3:
+            a_var = self._region_base_name(call.args[0])
+            b_var = self._region_base_name(call.args[1])
+            acc_var = self._region_base_name(call.args[2])
+            if a_var is None or b_var is None or acc_var is None:
+                return None
+            return self._mma_lines(a_var, b_var, acc_var)
+        return None
+
+    def _warp_shuffle_expr(self, value_expr: str, lane_expr: str) -> str:
+        """Lower warp shuffle using Gluon inline PTX over a lane vector."""
+        return (
+            'gl.inline_asm_elementwise("mov.b32 $0, $1;", "=r,r", ['
+            'gl.inline_asm_elementwise("shfl.sync.idx.b32 $0, $1, $2, 31, 0xffffffff;", "=r,r,r", ['
+            f'gl.inline_asm_elementwise("mov.b32 $0, $1;", "=r,r", [{value_expr}], dtype=gl.int32, is_pure=True, pack=1), '
+            f'{lane_expr}], dtype=gl.int32, is_pure=True, pack=1)'
+            '], dtype=gl.float32, is_pure=True, pack=1)'
+        )
+
+    def _generate_unrolled_loop(self, stmt: GluonLoop) -> bool:
+        if not any(self._is_thread_local_tensor(name) for name in self.allocs):
+            return False
+        start = self._eval_static_int(stmt.start)
+        end = self._eval_static_int(stmt.end)
+        step = self._eval_static_int(stmt.step)
+        if start is None or end is None or step is None:
+            return False
+
+        saved_env = dict(self.loop_constant_env)
+        for value in range(start, end, step):
+            self.loop_constant_env[stmt.var] = value
+            for body_stmt in stmt.body:
+                self._generate_stmt_with_static_env(body_stmt)
+            self.loop_constant_env = dict(saved_env)
+        return True
+
+    def _generate_stmt_with_static_env(self, stmt: Any):
+        if isinstance(stmt, GluonLoop):
+            self._generate_loop(stmt)
+            return
+        if isinstance(stmt, ast.AST):
+            substituted = self._substitute_loop_constants(stmt)
+            self._record_static_assignment(substituted)
+            self._generate_raw_ast(substituted)
+            return
+        self._generate_stmt(stmt)
+
+    def _substitute_loop_constants(self, stmt: ast.AST) -> ast.AST:
+        env = dict(self.loop_constant_env)
+
+        class ConstantSubstituter(ast.NodeTransformer):
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Load) and node.id in env:
+                    return ast.copy_location(ast.Constant(env[node.id]), node)
+                return node
+
+        return ast.fix_missing_locations(ConstantSubstituter().visit(ast.parse(ast.unparse(stmt)).body[0]))
+
+    def _record_static_assignment(self, stmt: ast.AST):
+        target_name = None
+        value_node = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target_name = stmt.targets[0].id
+            value_node = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            target_name = stmt.target.id
+            value_node = stmt.value
+        if target_name is None or value_node is None:
+            return
+        value = self._eval_static_int_ast(value_node)
+        if value is not None:
+            self.loop_constant_env[target_name] = value
+
+    def _eval_static_int(self, value: Any) -> Optional[int]:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, ast.AST):
+            return self._eval_static_int_ast(value)
+        if isinstance(value, str):
+            expr = self._fix_expr(str(value))
+            try:
+                return int(eval(expr, {"__builtins__": {}}, dict(self.loop_constant_env)))
+            except Exception:
+                return None
+        return None
+
+    def _eval_static_int_ast(self, node: ast.AST) -> Optional[int]:
+        substituted = self._substitute_loop_constants(ast.Expr(value=node)).value
+        expr = self._lower_ast_expr(substituted)
+        try:
+            return int(eval(expr, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    def _vector_axis_name(self, axis: int, var_name: str) -> str:
+        suffix = "row" if axis == 0 else "col"
+        name = f"{var_name}_{suffix}_idx_{self.vector_name_counter}"
+        self.vector_name_counter += 1
+        return name
+
+    def _emit_vector_axis(self, axis: int, extent: str, layout: str, axis_name: str) -> None:
+        if axis == 0:
+            self.lines.append(
+                f"{self._indent()}{axis_name} = gl.arange(0, {extent}, layout=gl.SliceLayout(1, {layout}))"
+            )
+        else:
+            self.lines.append(
+                f"{self._indent()}{axis_name} = gl.arange(0, {extent}, layout=gl.SliceLayout(0, {layout}))"
+            )
+
+    def _vector_index_expr(self, axis_info: dict[str, dict[str, Any]], var_name: str, *, for_tensor: bool) -> str:
+        info = axis_info[var_name]
+        if len(axis_info) == 1:
+            return info["name"]
+        if info["axis"] == 0:
+            return f"{info['name']}[:, None]" if for_tensor else f"{info['name']}[:, None]"
+        return f"{info['name']}[None, :]" if for_tensor else f"{info['name']}[None, :]"
+
+    def _broadcast_to_target(
+        self,
+        value_expr: str,
+        *,
+        expanded_axis: int,
+        target_shape: list[Any],
+        target_layout: str,
+    ) -> str:
+        rows = str(target_shape[0])
+        cols = str(target_shape[1])
+        parent_layout = self._blocked_layout_expr(rows, cols)
+        slice_layout = f"gl.SliceLayout({expanded_axis}, {parent_layout})"
+        broadcasted = (
+            f"gl.convert_layout({value_expr}, {slice_layout}).expand_dims({expanded_axis}).broadcast_to(({rows}, {cols}))"
+        )
+        return f"gl.convert_layout({broadcasted}, {target_layout})"
+
+    def _lower_vectorized_index_expr(self, node: ast.AST, axis_info: dict[str, dict[str, Any]]) -> str:
+        if isinstance(node, ast.Name) and node.id in axis_info:
+            return self._vector_index_expr(axis_info, node.id, for_tensor=False)
+        if isinstance(node, ast.Constant):
+            return repr(node.value)
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "T":
+                return self._dtype_attr_expr(node.attr)
+            return f"{self._lower_vectorized_index_expr(node.value, axis_info)}.{node.attr}"
+        if isinstance(node, ast.BinOp):
+            return (
+                f"({self._lower_vectorized_index_expr(node.left, axis_info)} "
+                f"{self._operator_str(node.op)} "
+                f"{self._lower_vectorized_index_expr(node.right, axis_info)})"
+            )
+        if isinstance(node, ast.UnaryOp):
+            unary = {
+                ast.UAdd: "+",
+                ast.USub: "-",
+                ast.Not: "not ",
+                ast.Invert: "~",
+            }[type(node.op)]
+            return f"({unary}{self._lower_vectorized_index_expr(node.operand, axis_info)})"
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "T":
+                    if node.func.attr == "bool":
+                        return self._lower_vectorized_index_expr(node.args[0], axis_info)
+                    if node.func.attr in {
+                        "float16", "float32", "float64",
+                        "int8", "int16", "int32", "int64",
+                        "uint8", "uint16", "uint32", "uint64",
+                        "bfloat16",
+                    }:
+                        return self._lower_vectorized_index_expr(node.args[0], axis_info)
+            return self._lower_ast_expr(node)
+        return self._lower_ast_expr(node)
+
+    def _lower_vectorized_expr(
+        self,
+        node: ast.AST,
+        axis_info: dict[str, dict[str, Any]],
+        target_shape: Optional[list[Any]] = None,
+        target_layout: Optional[str] = None,
+    ) -> str:
+        if isinstance(node, ast.Name):
+            if node.id in axis_info:
+                if target_shape is not None and target_layout is not None and len(axis_info) > 1:
+                    expanded_axis = 1 if axis_info[node.id]["axis"] == 0 else 0
+                    return self._broadcast_to_target(
+                        axis_info[node.id]["name"],
+                        expanded_axis=expanded_axis,
+                        target_shape=target_shape,
+                        target_layout=target_layout,
+                    )
+                return self._vector_index_expr(axis_info, node.id, for_tensor=True)
+            return node.id
+        if isinstance(node, ast.Constant):
+            return repr(node.value)
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "T":
+                return self._dtype_attr_expr(node.attr)
+            return f"{self._lower_vectorized_expr(node.value, axis_info)}.{node.attr}"
+        if isinstance(node, ast.BinOp):
+            return (
+                f"({self._lower_vectorized_expr(node.left, axis_info, target_shape, target_layout)} "
+                f"{self._operator_str(node.op)} "
+                f"{self._lower_vectorized_expr(node.right, axis_info, target_shape, target_layout)})"
+            )
+        if isinstance(node, ast.UnaryOp):
+            unary = {
+                ast.UAdd: "+",
+                ast.USub: "-",
+                ast.Not: "not ",
+                ast.Invert: "~",
+            }[type(node.op)]
+            return f"({unary}{self._lower_vectorized_expr(node.operand, axis_info, target_shape, target_layout)})"
+        if isinstance(node, ast.BoolOp):
+            joiner = " and " if isinstance(node.op, ast.And) else " or "
+            return "(" + joiner.join(self._lower_vectorized_expr(v, axis_info, target_shape, target_layout) for v in node.values) + ")"
+        if isinstance(node, ast.Compare):
+            left = self._lower_vectorized_expr(node.left, axis_info, target_shape, target_layout)
+            parts = []
+            for op, comp in zip(node.ops, node.comparators):
+                parts.append(f"{left} {self._cmp_str(op)} {self._lower_vectorized_expr(comp, axis_info, target_shape, target_layout)}")
+                left = self._lower_vectorized_expr(comp, axis_info, target_shape, target_layout)
+            return "(" + " and ".join(parts) + ")"
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "T":
+                    if node.func.attr == "if_then_else":
+                        cond = self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)
+                        true_val = self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)
+                        false_val = self._lower_vectorized_expr(node.args[2], axis_info, target_shape, target_layout)
+                        return f"tl.where({cond}, {true_val}, {false_val})"
+                    if node.func.attr == "max":
+                        return f"tl.maximum({self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)}, {self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)})"
+                    if node.func.attr == "min":
+                        return f"tl.minimum({self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)}, {self._lower_vectorized_expr(node.args[1], axis_info, target_shape, target_layout)})"
+                    if node.func.attr == "bool":
+                        return self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)
+                    if node.func.attr in {
+                        "float16", "float32", "float64",
+                        "int8", "int16", "int32", "int64",
+                        "uint8", "uint16", "uint32", "uint64",
+                        "bfloat16",
+                    }:
+                        return self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)
+                if node.func.attr == "astype":
+                    base = self._lower_vectorized_expr(node.func.value, axis_info, target_shape, target_layout)
+                    dtype_expr = self._lower_vectorized_expr(node.args[0], axis_info, target_shape, target_layout)
+                    return f"{base}.to({dtype_expr})"
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+                args = ", ".join(self._lower_vectorized_expr(arg, axis_info, target_shape, target_layout) for arg in node.args)
+                return f"{func_name}({args})"
+            return self._lower_ast_expr(node)
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name):
+                tensor_name = node.value.id
+                indices = self._subscript_indices(node)
+                alloc = self.allocs.get(tensor_name)
+                if alloc is not None:
+                    shape = list(getattr(alloc, "shape", None) or [])
+                    axis_names = [idx.id if isinstance(idx, ast.Name) else None for idx in indices]
+                    if len(shape) == 1 and len(indices) == 1 and axis_names[0] in axis_info:
+                        if target_shape is not None and target_layout is not None and len(axis_info) > 1:
+                            expanded_axis = 1 if axis_info[axis_names[0]]["axis"] == 0 else 0
+                            return self._broadcast_to_target(
+                                tensor_name,
+                                expanded_axis=expanded_axis,
+                                target_shape=target_shape,
+                                target_layout=target_layout,
+                            )
+                        if len(axis_info) > 1 and axis_info[axis_names[0]]["axis"] == 0:
+                            return f"{tensor_name}[:, None]"
+                        return tensor_name
+                    if len(shape) >= 2 and len(indices) >= 2:
+                        if axis_names[0] in axis_info and axis_info[axis_names[0]]["axis"] == 0:
+                            if axis_names[1] in axis_info and axis_info[axis_names[1]]["axis"] == 1:
+                                return tensor_name
+                if self._is_global_tensor(tensor_name):
+                    ptr_expr = self._lower_vectorized_global_ptr_expr(tensor_name, indices, axis_info)
+                    mask_expr = self._lower_vectorized_global_mask_expr(tensor_name, indices, axis_info)
+                    return f"gl.load({ptr_expr}, mask={mask_expr})"
+            return self._lower_ast_expr(node)
+        return self._lower_ast_expr(node)
+
+    def _lower_vectorized_global_ptr_expr(self, tensor_name: str, indices: list[ast.AST], axis_info: dict[str, dict[str, Any]]) -> str:
+        lowered = [self._lower_vectorized_index_expr(idx, axis_info) for idx in indices]
+        rank = self._tensor_rank(tensor_name)
+        if rank <= 1 or len(lowered) == 1:
+            return f"{tensor_name} + ({lowered[0]})"
+        if len(lowered) == 2:
+            return (
+                f"{tensor_name} + ({lowered[0]}) * {self._row_stride_expr(tensor_name)} "
+                f"+ ({lowered[1]})"
+            )
+        return self._lower_global_ptr_expr(tensor_name, indices)
+
+    def _lower_vectorized_global_mask_expr(self, tensor_name: str, indices: list[ast.AST], axis_info: dict[str, dict[str, Any]]) -> str:
+        lowered = [self._lower_vectorized_index_expr(idx, axis_info) for idx in indices]
+        if self._tensor_rank(tensor_name) <= 1 or len(lowered) == 1:
+            return f"({lowered[0]}) < {self._dim_expr(tensor_name, 0)}"
+        if len(lowered) == 2:
+            return (
+                f"(({lowered[0]}) < {self._dim_expr(tensor_name, 0)}) & "
+                f"(({lowered[1]}) < {self._dim_expr(tensor_name, 1)})"
+            )
+        return "True"
+
+    def _emit_vectorized_assign(self, assign: ast.Assign, axis_info: dict[str, dict[str, Any]]) -> bool:
+        if len(assign.targets) != 1 or not isinstance(assign.targets[0], ast.Subscript):
+            return False
+        target = assign.targets[0]
+        if not isinstance(target.value, ast.Name):
+            return False
+
+        target_name = target.value.id
+        target_shape = None
+        target_layout = None
+        alloc = self.allocs.get(target_name)
+        if alloc is not None:
+            shape = list(getattr(alloc, "shape", None) or [])
+            target_shape = shape if len(shape) >= 2 else None
+            target_layout = self._tensor_layout_expr(target_name) if target_shape is not None else None
+        value_expr = self._lower_vectorized_expr(assign.value, axis_info, target_shape, target_layout)
+        if alloc is not None:
+            axis_names = [idx.id if isinstance(idx, ast.Name) else None for idx in self._subscript_indices(target)]
+            if len(shape) == 1 and len(axis_names) == 1 and axis_names[0] in axis_info:
+                self.lines.append(f"{self._indent()}{target_name} = {value_expr}")
+                return True
+            if len(shape) >= 2 and len(axis_names) >= 2:
+                if axis_names[0] in axis_info and axis_names[1] in axis_info:
+                    self.lines.append(f"{self._indent()}{target_name} = {value_expr}")
+                    return True
+
+        if self._is_global_tensor(target_name):
+            if len(axis_info) == 1 and self._tensor_rank(target_name) > 1:
+                return self._emit_vectorized_global_store(assign, axis_info, value_expr)
+            ptr_expr = self._lower_vectorized_global_ptr_expr(target_name, self._subscript_indices(target), axis_info)
+            mask_expr = self._lower_vectorized_global_mask_expr(target_name, self._subscript_indices(target), axis_info)
+            self.lines.append(f"{self._indent()}gl.store({ptr_expr}, {value_expr}, mask={mask_expr})")
+            return True
+
+        return False
+
+    def _contains_loop_var(self, node: ast.AST, loop_var: str) -> bool:
+        return any(isinstance(child, ast.Name) and child.id == loop_var for child in ast.walk(node))
+
+    def _emit_vectorized_global_store(
+        self,
+        assign: ast.Assign,
+        axis_info: dict[str, dict[str, Any]],
+        value_expr: str,
+    ) -> bool:
+        """Lower a 1D vector write into a higher-rank global tensor when only one index varies."""
+        target = assign.targets[0]
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+            return False
+        indices = self._subscript_indices(target)
+        if len(indices) != 2:
+            return False
+
+        loop_var = next(iter(axis_info.keys()))
+        first_depends = self._contains_loop_var(indices[0], loop_var)
+        second_depends = self._contains_loop_var(indices[1], loop_var)
+        if first_depends == second_depends:
+            return False
+
+        vector_name = axis_info[loop_var]["name"]
+        lane_layout = self._vector_layout_expr(str(next(iter(axis_info.values()))["extent"]))
+
+        varying_expr = self._lower_vectorized_index_expr(indices[0] if first_depends else indices[1], axis_info)
+        scalar_expr = self._lower_ast_expr(indices[1] if first_depends else indices[0])
+        scalar_name = f"{vector_name}_scalar"
+        self.lines.append(
+            f"{self._indent()}{scalar_name} = gl.full([{next(iter(axis_info.values()))['extent']}], {scalar_expr}, gl.int32, layout={lane_layout})"
+        )
+
+        if first_depends:
+            row_expr = varying_expr
+            col_expr = scalar_name
+        else:
+            row_expr = scalar_name
+            col_expr = varying_expr
+
+        ptr_expr = (
+            f"{target.value.id} + ({row_expr}) * {self._row_stride_expr(target.value.id)} + ({col_expr})"
+        )
+        mask_expr = (
+            f"(({row_expr}) < {self._dim_expr(target.value.id, 0)}) & "
+            f"(({col_expr}) < {self._dim_expr(target.value.id, 1)})"
+        )
+        self.lines.append(f"{self._indent()}gl.store({ptr_expr}, {value_expr}, mask={mask_expr})")
+        return True
+
+    def _try_generate_vectorized_loop(self, stmt: GluonLoop) -> bool:
+        if any(self._is_thread_local_tensor(name) for name in self.allocs):
+            return False
+        if stmt.start != 0 or stmt.step != 1:
+            return False
+
+        if len(stmt.body) == 1 and isinstance(stmt.body[0], GluonLoop):
+            inner = stmt.body[0]
+            if inner.start != 0 or inner.step != 1:
+                return False
+            if not inner.body or not all(isinstance(s, ast.Assign) for s in inner.body):
+                return False
+
+            row_extent = str(stmt.end)
+            col_extent = str(inner.end)
+            layout = self._blocked_layout_expr(row_extent, col_extent)
+            axis_info = {
+                stmt.var: {"name": self._vector_axis_name(0, stmt.var), "axis": 0, "extent": row_extent},
+                inner.var: {"name": self._vector_axis_name(1, inner.var), "axis": 1, "extent": col_extent},
+            }
+            self._emit_vector_axis(0, row_extent, layout, axis_info[stmt.var]["name"])
+            self._emit_vector_axis(1, col_extent, layout, axis_info[inner.var]["name"])
+            for body_stmt in inner.body:
+                if not self._emit_vectorized_assign(body_stmt, axis_info):
+                    return False
+            return True
+
+        if not stmt.body or not all(isinstance(s, ast.Assign) for s in stmt.body):
+            return False
+
+        extent = str(stmt.end)
+        layout = self._vector_layout_expr(extent)
+        axis_info = {
+            stmt.var: {"name": self._vector_axis_name(0, stmt.var), "axis": 0, "extent": extent},
+        }
+        self.lines.append(
+            f"{self._indent()}{axis_info[stmt.var]['name']} = gl.arange(0, {extent}, layout={layout})"
+        )
+        for body_stmt in stmt.body:
+            if not self._emit_vectorized_assign(body_stmt, axis_info):
+                return False
+        return True
 
     def _substitute_loop_vars(self, expr: Any, replacements: dict[str, str]) -> str:
         """Substitute loop variables in an index expression with tensor expressions."""

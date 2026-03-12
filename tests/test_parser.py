@@ -234,6 +234,23 @@ def test_serial(A: T.Tensor((1024,), T.float32)):
         assert loop.end == 8
         assert any(isinstance(stmt, ast.Assign) for stmt in loop.body)
 
+    def test_parse_vectorized_loop_as_serial_range(self):
+        """T.vectorized should preserve loop bounds even when lowered conservatively."""
+        source = '''
+@T.prim_func
+def test_vectorized(A: T.Tensor((1024,), T.float32)):
+    with T.Kernel(1, threads=128):
+        for i in T.vectorized(0, 16):
+            tmp = i
+'''
+        parser = TileLangParser()
+        kernel = parser.parse(source)
+
+        loop = next(stmt for stmt in kernel.body if isinstance(stmt, SerialLoop))
+        assert loop.start == 0
+        assert loop.end == 16
+        assert any(isinstance(stmt, ast.Assign) for stmt in loop.body)
+
     def test_parse_atomic_add(self):
         """Test parsing atomic add operation."""
         source = '''

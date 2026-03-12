@@ -102,6 +102,10 @@ class TileLangKernel:
     block_dims: List[Any]
     block_vars: List[str]
     thread_count: int
+    thread_dims: List[Any] = field(default_factory=lambda: [128, 1, 1])
+    thread_var_names: List[Optional[str]] = field(default_factory=lambda: [None, None, None])
+    output_params: List[str] = field(default_factory=list)
+    is_lowered_tir: bool = False
     body: List[Any] = field(default_factory=list)
 
 
@@ -137,12 +141,19 @@ class TileLangParser:
 
     def _parse_kernel_function(self, node: ast.FunctionDef) -> TileLangKernel:
         """Parse kernel function definition."""
+        if self._is_tir_lowered_kernel(node):
+            return self._parse_tir_kernel_function(node)
+
         kernel = TileLangKernel(
             name=node.name,
             params=self._parse_params(node.args),
             block_dims=[],
             block_vars=[],
             thread_count=128,
+            thread_dims=[128, 1, 1],
+            thread_var_names=[None, None, None],
+            output_params=[],
+            is_lowered_tir=False,
             body=[]
         )
         self.current_kernel = kernel
@@ -156,7 +167,189 @@ class TileLangParser:
                 else:
                     kernel.body.append(parsed)
 
+        self._augment_output_params(kernel)
         return kernel
+
+    def _is_tir_lowered_kernel(self, node: ast.FunctionDef) -> bool:
+        """Detect whether this prim_func is a lowered TIR-style kernel."""
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                if isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr in {
+                    "match_buffer",
+                    "launch_thread",
+                }:
+                    return True
+            if isinstance(stmt, ast.With):
+                for item in stmt.items:
+                    ctx = item.context_expr
+                    if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute):
+                        if ctx.func.attr == "block":
+                            return True
+        return False
+
+    def _parse_tir_kernel_function(self, node: ast.FunctionDef) -> TileLangKernel:
+        """Parse a lowered TIR-style prim_func emitted by TileLang."""
+        kernel = TileLangKernel(
+            name=node.name,
+            params=[],
+            block_dims=[],
+            block_vars=[],
+            thread_count=128,
+            thread_dims=[128, 1, 1],
+            thread_var_names=[None, None, None],
+            output_params=[],
+            is_lowered_tir=True,
+            body=[],
+        )
+        self.current_kernel = kernel
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if isinstance(call.func, ast.Attribute) and call.func.attr == "match_buffer":
+                    param = self._parse_match_buffer(stmt)
+                    if param:
+                        kernel.params.append(param)
+                    continue
+                if isinstance(call.func, ast.Attribute) and call.func.attr == "launch_thread":
+                    self._parse_launch_thread(stmt, kernel)
+                    continue
+            if isinstance(stmt, ast.With) and self._is_tir_block(stmt):
+                for inner in stmt.body:
+                    self._parse_tir_block_stmt(inner, kernel)
+                continue
+
+            parsed = self._parse_stmt(stmt)
+            if parsed:
+                if isinstance(parsed, list):
+                    kernel.body.extend(parsed)
+                else:
+                    kernel.body.append(parsed)
+
+        kernel.thread_count = kernel.thread_dims[0]
+        self._augment_output_params(kernel)
+        return kernel
+
+    def _augment_output_params(self, kernel: TileLangKernel) -> None:
+        """Infer additional output tensors from explicit global writes in the body."""
+        known_params = {
+            param["name"]
+            for param in kernel.params
+            if param.get("annotation", {}).get("type") == "Tensor"
+        }
+        outputs = list(kernel.output_params)
+
+        def add(name: Optional[str]) -> None:
+            if name and name in known_params and name not in outputs:
+                outputs.append(name)
+
+        for stmt in kernel.body:
+            if isinstance(stmt, CopyOp):
+                add(stmt.dst)
+                continue
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Subscript):
+                        add(self._extract_buffer_ref(target))
+            if isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Subscript):
+                add(self._extract_buffer_ref(stmt.target))
+
+        kernel.output_params = outputs
+
+    def _is_tir_block(self, stmt: ast.With) -> bool:
+        """Return whether the with-statement is a T.block region."""
+        for item in stmt.items:
+            ctx = item.context_expr
+            if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute):
+                if ctx.func.attr == "block":
+                    return True
+        return False
+
+    def _parse_tir_block_stmt(self, stmt: ast.AST, kernel: TileLangKernel) -> None:
+        """Parse statements inside a lowered T.block region."""
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+            if isinstance(call.func, ast.Attribute):
+                if call.func.attr == "writes":
+                    kernel.output_params = self._extract_buffer_names(call.args)
+                    return
+                if call.func.attr == "reads":
+                    return
+
+        parsed = self._parse_stmt(stmt)
+        if parsed:
+            if isinstance(parsed, list):
+                kernel.body.extend(parsed)
+            else:
+                kernel.body.append(parsed)
+        else:
+            kernel.body.append(stmt)
+
+    def _parse_match_buffer(self, stmt: ast.Assign) -> Optional[Dict[str, Any]]:
+        """Parse T.match_buffer into a tensor parameter entry."""
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return None
+        call = stmt.value
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            return None
+        if call.func.attr != "match_buffer":
+            return None
+
+        shape = self._extract_value(call.args[1]) if len(call.args) > 1 else []
+        dtype = "float32"
+        if len(call.args) > 2:
+            dtype = self._extract_dtype(call.args[2])
+
+        return {
+            "name": stmt.targets[0].id,
+            "annotation": {
+                "type": "Tensor",
+                "shape": shape,
+                "dtype": dtype,
+            },
+        }
+
+    def _parse_launch_thread(self, stmt: ast.Assign, kernel: TileLangKernel) -> None:
+        """Parse T.launch_thread into grid/thread metadata."""
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return
+        call = stmt.value
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            return
+        if call.func.attr != "launch_thread" or len(call.args) < 2:
+            return
+
+        axis = self._extract_value(call.args[0])
+        extent = self._extract_value(call.args[1])
+        var_name = stmt.targets[0].id
+
+        if axis == "blockIdx.x":
+            while len(kernel.block_dims) < 1:
+                kernel.block_dims.append(1)
+                kernel.block_vars.append(f"b{len(kernel.block_vars)}")
+            kernel.block_dims[0] = extent
+            kernel.block_vars[0] = var_name
+        elif axis == "blockIdx.y":
+            while len(kernel.block_dims) < 2:
+                kernel.block_dims.append(1)
+                kernel.block_vars.append(f"b{len(kernel.block_vars)}")
+            kernel.block_dims[1] = extent
+            kernel.block_vars[1] = var_name
+        elif axis == "blockIdx.z":
+            while len(kernel.block_dims) < 3:
+                kernel.block_dims.append(1)
+                kernel.block_vars.append(f"b{len(kernel.block_vars)}")
+            kernel.block_dims[2] = extent
+            kernel.block_vars[2] = var_name
+        elif axis == "threadIdx.x":
+            kernel.thread_dims[0] = extent
+            kernel.thread_var_names[0] = var_name
+        elif axis == "threadIdx.y":
+            kernel.thread_dims[1] = extent
+            kernel.thread_var_names[1] = var_name
+        elif axis == "threadIdx.z":
+            kernel.thread_dims[2] = extent
+            kernel.thread_var_names[2] = var_name
 
     def _parse_params(self, args: ast.arguments) -> List[Dict[str, Any]]:
         """Parse function parameters."""
@@ -201,6 +394,8 @@ class TileLangParser:
             return node.attr
         elif isinstance(node, ast.Name):
             return node.id
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
         return "float32"
 
     def _parse_stmt(self, stmt: ast.AST) -> Optional[Any]:
@@ -239,7 +434,18 @@ class TileLangParser:
                         # Extract thread count from keywords
                         for kw in call.keywords:
                             if kw.arg == "threads":
-                                self.current_kernel.thread_count = self._extract_value(kw.value)
+                                thread_value = self._extract_value(kw.value)
+                                if isinstance(thread_value, (list, tuple)):
+                                    dims = list(thread_value)[:3]
+                                    dims += [1] * (3 - len(dims))
+                                    self.current_kernel.thread_dims = dims
+                                    if all(isinstance(dim, int) for dim in dims):
+                                        self.current_kernel.thread_count = dims[0] * dims[1] * dims[2]
+                                    else:
+                                        self.current_kernel.thread_count = 128
+                                else:
+                                    self.current_kernel.thread_count = thread_value
+                                    self.current_kernel.thread_dims = [thread_value, 1, 1]
 
                         # Parse body
                         body_stmts = []
@@ -321,8 +527,63 @@ class TileLangParser:
                         else:
                             loop.body.append(stmt)
                     return loop
+                elif call.func.attr == "vectorized":
+                    if len(call.args) == 1:
+                        start = 0
+                        end = self._extract_value(call.args[0])
+                    else:
+                        start = self._extract_value(call.args[0]) if len(call.args) > 0 else 0
+                        end = self._extract_value(call.args[1]) if len(call.args) > 1 else 0
+                    loop = SerialLoop(var=loop_var, start=start, end=end, body=[])
+                    for stmt in node.body:
+                        parsed = self._parse_stmt(stmt)
+                        if parsed:
+                            loop.body.append(parsed)
+                        else:
+                            loop.body.append(stmt)
+                    return loop
+
+                elif call.func.attr == "parallel":
+                    extent = self._extract_value(call.args[0]) if call.args else 0
+                    loop = ParallelLoop(
+                        var=loop_var,
+                        extent=extent,
+                        body=[],
+                    )
+                    loop.all_vars = [loop_var]
+                    if len(call.args) > 1:
+                        loop.extra_dims = [self._extract_value(arg) for arg in call.args[1:]]
+                        all_vars = [loop_var]
+                        if isinstance(node.target, ast.Tuple):
+                            all_vars = [elt.id if isinstance(elt, ast.Name) else f"i{idx}" for idx, elt in enumerate(node.target.elts)]
+                            loop.var = all_vars[0]
+                            loop.all_vars = all_vars
+                    for stmt in node.body:
+                        parsed = self._parse_stmt(stmt)
+                        if parsed:
+                            loop.body.append(parsed)
+                        else:
+                            loop.body.append(stmt)
+                    return loop
 
         # Regular Python for loop
+        if isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range":
+            start = 0
+            end = 0
+            if len(node.iter.args) == 1:
+                end = self._extract_value(node.iter.args[0])
+            elif len(node.iter.args) >= 2:
+                start = self._extract_value(node.iter.args[0])
+                end = self._extract_value(node.iter.args[1])
+            loop = SerialLoop(var=loop_var, start=start, end=end, body=[])
+            for stmt in node.body:
+                parsed = self._parse_stmt(stmt)
+                if parsed:
+                    loop.body.append(parsed)
+                else:
+                    loop.body.append(stmt)
+            return loop
+
         loop = SerialLoop(
             var=loop_var,
             start=0,
@@ -386,6 +647,11 @@ class TileLangParser:
                     if node.targets and isinstance(node.targets[0], ast.Name):
                         result.name = node.targets[0].id
                     return result
+                elif call.func.attr == "alloc_buffer":
+                    result = self._parse_alloc_buffer(call)
+                    if node.targets and isinstance(node.targets[0], ast.Name):
+                        result.name = node.targets[0].id
+                    return result
         return node
 
     def _parse_ann_assign(self, node: ast.AnnAssign) -> Optional[Stmt]:
@@ -412,6 +678,18 @@ class TileLangParser:
         dtype = self._extract_value(call.args[1]) if len(call.args) > 1 else "float32"
         return AllocLocal(name="", shape=shape, dtype=dtype)
 
+    def _parse_alloc_buffer(self, call: ast.Call) -> Stmt:
+        """Parse T.alloc_buffer() from lowered TIR."""
+        shape = self._extract_value(call.args[0]) if call.args else [1]
+        dtype = self._extract_value(call.args[1]) if len(call.args) > 1 else "float32"
+        scope = ""
+        for kw in call.keywords:
+            if kw.arg == "scope":
+                scope = self._extract_value(kw.value)
+        if scope == "local.fragment":
+            return AllocFragment(name="", shape=shape, dtype=dtype)
+        return AllocLocal(name="", shape=shape, dtype=dtype)
+
     def _parse_copy(self, call: ast.Call) -> CopyOp:
         """Parse T.copy() call."""
         src = self._extract_buffer_ref(call.args[0]) if call.args else ""
@@ -422,8 +700,12 @@ class TileLangParser:
         dst_indices = None
         if call.args and isinstance(call.args[0], ast.Subscript):
             src_indices = self._extract_indices(call.args[0])
+        elif call.args and isinstance(call.args[0], ast.Call):
+            src_indices = self._extract_region_indices(call.args[0])
         if len(call.args) > 1 and isinstance(call.args[1], ast.Subscript):
             dst_indices = self._extract_indices(call.args[1])
+        elif len(call.args) > 1 and isinstance(call.args[1], ast.Call):
+            dst_indices = self._extract_region_indices(call.args[1])
 
         return CopyOp(src=src, dst=dst, src_indices=src_indices, dst_indices=dst_indices)
 
@@ -476,6 +758,9 @@ class TileLangParser:
             return node.id
         elif isinstance(node, ast.Subscript):
             return self._extract_buffer_ref(node.value)
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "region" and node.args:
+                return self._extract_buffer_ref(node.args[0])
         elif isinstance(node, ast.Attribute):
             return node.attr
         return ""
@@ -489,6 +774,24 @@ class TileLangParser:
         else:
             indices.append(self._extract_value(node.slice))
         return indices
+
+    def _extract_region_indices(self, node: ast.Call) -> List[Any]:
+        """Extract base indices from T.region(buffer[idx...], ...)."""
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "region" or not node.args:
+            return []
+        region_ref = node.args[0]
+        if isinstance(region_ref, ast.Subscript):
+            return self._extract_indices(region_ref)
+        return []
+
+    def _extract_buffer_names(self, args: List[ast.AST]) -> List[str]:
+        """Extract buffer names from T.reads/T.writes arguments."""
+        names = []
+        for arg in args:
+            name = self._extract_buffer_ref(arg)
+            if name:
+                names.append(name)
+        return names
 
     def _extract_value(self, node: ast.AST) -> Any:
         """Extract value from AST node."""
@@ -545,4 +848,14 @@ class TileLangParser:
                         return (a + b - 1) // b
                     # Return as string for symbolic expressions
                     return f"ceildiv({a}, {b})"
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "T":
+                    if node.func.attr == "bool" and node.args:
+                        return self._extract_value(node.args[0])
+                    if node.func.attr in {
+                        "float16", "float32", "float64",
+                        "int8", "int16", "int32", "int64",
+                        "uint8", "uint16", "uint32", "uint64",
+                        "bfloat16",
+                    } and node.args:
+                        return self._extract_value(node.args[0])
         return None

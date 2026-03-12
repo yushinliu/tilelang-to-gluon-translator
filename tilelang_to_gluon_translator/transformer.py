@@ -28,6 +28,7 @@ class GluonRegisterTensor:
     shape: List[int]
     dtype: str
     layout: str
+    is_thread_local: bool = False
 
 
 @dataclass
@@ -143,6 +144,7 @@ class GluonKernel:
     params: List[Dict[str, Any]]
     grid: List[Any]
     num_warps: int
+    output_params: List[str] = field(default_factory=list)
     body: List[Any] = field(default_factory=list)
     tensor_descriptors: List[GluonTensorDescriptor] = field(default_factory=list)
     shared_allocs: List[GluonAllocShared] = field(default_factory=list)
@@ -162,6 +164,7 @@ class TileLangToGluonTransformer:
 
     # Dtype mapping from TileLang to Gluon
     DTYPE_MAP = {
+        "float8_e4m3fn": "gl.float8e4nv",
         "float16": "gl.float16",
         "float32": "gl.float32",
         "float64": "gl.float64",
@@ -195,7 +198,7 @@ class TileLangToGluonTransformer:
         if isinstance(thread_count, str):
             # If thread_count is a variable name, use default (128)
             thread_count = 128
-        num_warps = max(thread_count // 32, 1)
+        num_warps = max(thread_count // 32, 4)
 
         # Extract block dimensions from the first allocations (common pattern)
         block_M = 32
@@ -208,6 +211,7 @@ class TileLangToGluonTransformer:
             params=self._transform_params(kernel.params),
             grid=self._compute_grid(kernel.block_dims),
             num_warps=num_warps,
+            output_params=list(getattr(kernel, "output_params", [])),
             body=[],
             tensor_descriptors=[],
             shared_allocs=[],
@@ -218,6 +222,10 @@ class TileLangToGluonTransformer:
         gluon_kernel.block_N = block_N
         gluon_kernel.in_dtype = in_dtype
         gluon_kernel.out_dtype = out_dtype
+        gluon_kernel.thread_dims = list(getattr(kernel, "thread_dims", [thread_count, 1, 1]))
+        gluon_kernel.thread_var_names = list(getattr(kernel, "thread_var_names", [None, None, None]))
+        gluon_kernel.uses_mma = self._kernel_uses_mma(kernel.body)
+        gluon_kernel.is_lowered_tir = getattr(kernel, "is_lowered_tir", False)
         self.current_kernel = gluon_kernel
 
         for axis, var_name in enumerate(kernel.block_vars):
@@ -370,8 +378,11 @@ class TileLangToGluonTransformer:
             shape = [stmt.shape]
         dtype = self._map_dtype(stmt.dtype)
 
-        # 2D/3D fragments are typically MMA accumulators; scalar/vector fragments stay blocked.
-        if len(shape) >= 2:
+        # Non-GEMM kernels use fragments for generic elementwise/reduction tiles, not MMA accumulators.
+        if len(shape) >= 2 and (
+            getattr(self.current_kernel, "uses_mma", False)
+            or not getattr(self.current_kernel, "is_lowered_tir", False)
+        ):
             layout = self._infer_mma_layout(shape, dtype)
         else:
             layout = self._infer_blocked_layout(shape, dtype)
@@ -398,12 +409,18 @@ class TileLangToGluonTransformer:
 
         # Use BlockedLayout for local/thread memory
         layout = self._infer_blocked_layout(shape, dtype)
+        is_thread_local = bool(
+            any(name is not None for name in getattr(self.current_kernel, "thread_var_names", []))
+            and len(shape) == 1
+            and shape[0] != 1
+        )
 
         reg_tensor = GluonRegisterTensor(
             name=stmt.name,
             shape=shape,
             dtype=dtype,
-            layout=layout
+            layout=layout,
+            is_thread_local=is_thread_local,
         )
         self.current_kernel.register_tensors.append(reg_tensor)
         return reg_tensor
@@ -442,13 +459,48 @@ class TileLangToGluonTransformer:
         num_warps = getattr(self.current_kernel, "num_warps", 4)
         rank = len(shape) if shape else 1
         if rank == 1:
-            return f"gl.BlockedLayout([1], [32], [{num_warps}], [0])"
+            try:
+                extent = int(shape[0])
+                size = max(extent // max(num_warps * 32, 1), 1)
+                return f"gl.BlockedLayout([{size}], [32], [{num_warps}], [0])"
+            except Exception:
+                return f"gl.BlockedLayout([1], [32], [{num_warps}], [0])"
         if rank == 2:
-            return f"gl.BlockedLayout([1, 1], [1, 32], [{num_warps}, 1], [1, 0])"
+            try:
+                rows = int(shape[0])
+                cols = int(shape[1])
+                size_x = max(rows // max(num_warps, 1), 1)
+                size_y = max(cols // 32, 1)
+                return (
+                    f"gl.BlockedLayout([{size_x}, {size_y}], [1, 32], "
+                    f"[{num_warps}, 1], [1, 0])"
+                )
+            except Exception:
+                return f"gl.BlockedLayout([1, 1], [1, 32], [{num_warps}, 1], [1, 0])"
         dims = ", ".join(["1"] * rank)
         warps = ", ".join([str(num_warps)] + ["1"] * (rank - 1))
         order = ", ".join(str(i) for i in reversed(range(rank)))
         return f"gl.BlockedLayout([{dims}], [{dims}], [{warps}], [{order}])"
+
+    def _kernel_uses_mma(self, body: List[Any]) -> bool:
+        """Return whether the parsed kernel body contains GEMM/MMA ops."""
+        for stmt in body:
+            if isinstance(stmt, GemmOp):
+                return True
+            if isinstance(stmt, ast.AST):
+                for node in ast.walk(stmt):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "T"
+                        and node.func.attr in {"gemm", "gemm_py"}
+                    ):
+                        return True
+            nested_body = getattr(stmt, "body", None)
+            if nested_body and self._kernel_uses_mma(nested_body):
+                return True
+        return False
 
     def _transform_copy(self, stmt: CopyOp) -> Optional[Union[GluonStmt, List[GluonStmt]]]:
         """Transform copy operation to TMA operations."""

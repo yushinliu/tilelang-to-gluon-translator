@@ -1,5 +1,109 @@
 # TileLang to Gluon 测试计划
 
+## 2026-03-12 SIMT/Hadamard 计划更新
+
+### 已完成
+- `hadamard_transform` 已新增真实 GPU 回归并通过
+- lowered TIR `threadIdx` 已接通到 pointer-mode codegen
+- `T.tvm_warp_shuffle(...)` 已通过 Gluon `inline_asm_elementwise("shfl.sync.idx.b32")` 接通
+- 对含 thread-local local array 的静态小循环，codegen 已支持常量传播和展开
+
+### 当前收益
+- `examples/hadamard_transform/example_hadamard.py` 已能真实转换到 Gluon 并在 GPU 上通过精度验证
+- 这条路径证明当前 translator 已具备一条最小可用的 SIMT local-array + warp-shuffle lowering 链
+
+### 下一步拆分
+1. **继续推进未覆盖 SIMT 类 examples**
+   - `gemv`
+   - `linear_attention`
+   - 选择一个不依赖额外上游布局修复的 `flash_decoding` / `attention_sink` 入口先做 probe
+2. **收敛 thread-local lowering 的泛化边界**
+   - 当前静态展开只覆盖“边界可静态求值”的 thread-local 小循环
+   - 后续需要评估是否要把这条能力泛化到更多 SIMT TIR 模式
+3. **继续保留 `cast` 为单独问题线**
+   - `cast` 当前仍更像 Gluon 3.6 的 FP8 rounding 运行时缺口，不与 SIMT 线混做
+
+## 2026-03-12 FP8 计划更新
+
+### 已完成
+- `topk` 已从 `xfail` 转正
+- `dynamic_shape` 已新增真实 GPU 回归并通过
+- `cast` 的 parser / transformer / vectorized fragment lowering / JITKernel-TIR 入口已经补齐
+- 已通过独立 Gluon probe 证明 `cast` 当前不是广播或布局转换错误，而是 computed float32 value 到 FP8 的 rounding 偏差
+- lowered TIR `dynamic m/n/k` 符号和 `T.gemm_py(...)` 已接通
+
+### 当前唯一明确阻塞
+1. **Gluon 3.6 computed SSA value -> FP8 rounding**
+   - 现象：对计算得到的 float32 值执行 FP8 cast/store 时，结果会向零偏一档
+   - 已排除：
+     - 1D/2D blocked 广播错误
+     - scale/reduce 错误
+     - 直接 load 的 float32 向量 cast 到 FP8 的 dtype 映射错误
+   - 当前判断：更像 Gluon 运行时在该路径上的 rounding bug，而不是 translator 的 AST/codegen bug
+
+### 下一步拆分
+1. **尝试纯 codegen workaround**
+   - 评估是否能通过“先 materialize 再 cast”或显式 rounding-bias 修正来模拟 RTNE
+   - 目标只先覆盖 `cast/example_per_token_cast_to_fp8.py`
+2. **如果 workaround 不可靠，保留 `cast` 为已知运行时限制**
+   - 在状态文档里明确这是 Triton/Gluon 3.6 的运行时缺口
+   - 继续推进未覆盖 examples 的其它目录
+3. **继续扩展 example 覆盖**
+   - `gemv`
+   - `flash_decoding`
+   - `linear_attention`
+
+## 2026-03-10 SIMT 计划更新
+
+## 2026-03-10 JITKernel/TIR 计划更新
+
+### 已完成
+- `to_gluon` 现在能直接吃实例化后的 `JITKernel`
+- 已打通 `prim_func.script()` 的最小 TIR 翻译入口
+- 已新增真实 upstream `cast` / `topk` 回归并保留为 `xfail`
+
+### 当前剩余缺口
+1. **fragment 标量索引 -> 向量化表达式 lowering**
+   - 典型模式：
+     - `y_amax_local[i] = ...`
+     - `expand_max_idx[i, j] = tl.where(...)`
+     - `logits_frag[i, j] = ...`
+   - Gluon 不接受当前这种 Python 标量循环 + fragment 下标写法
+2. **TIR reduction / compare-select 的 block 级向量化**
+   - `reduce(max/absmax)` 后续通常会紧跟 elementwise compare/select
+   - 需要直接生成整块张量表达式，而不是逐元素 scalar loop
+3. **继续扩展真实 example 覆盖**
+   - `gemv`
+   - `cast`
+   - `topk`
+   - 再推进 `flash_decoding` / `linear_attention`
+
+### 当前进一步收敛的具体技术点
+- `cast`
+  - 非 GEMM TIR fragment 已切到 blocked layout
+  - `absmax` / 广播主路径已接通
+  - 下一步只剩 1D blocked 值安全写回 2D 全局 tensor
+- `topk`
+  - 需要让 `max_val` / `col_idx` 这类 1D 值在 `tl.where` 前先变成与 `logits_frag`/`expand_max_idx` 兼容的 distributed layout
+
+### 已完成
+- 已完成最小 SIMT lowering：
+  - `get_thread_binding`
+  - conservative `vectorized -> serial`
+  - pointer mode 下的基础全局下标 load/store
+  - local scalar accumulator
+- 已有真实 GPU 回归覆盖这条路径
+
+### 下一步拆分
+1. **JITKernel 输入支持**
+   - 让 `to_gluon` 能直接接收 TileLang example 返回的 `tilelang.jit.kernel.JITKernel`
+   - 评估是恢复高层 TileLang 源，还是新增一条 TIR/PrimFunc 翻译入口
+2. **复杂逻辑线程语义**
+   - 处理像 `examples/gemv` 这类 TileLang 自身已出现 `tn >= block_N` 告警的 kernel
+   - 需要区分“逻辑线程索引”和“实际 CTA 线程布局”
+3. **继续回填未覆盖 examples**
+   - 在最小 SIMT lowering 基础上，优先继续推进 `gemv`、`cast`、`topk`
+
 ## 2026-03-09 发布门槛更新
 
 ### 发布前置条件
